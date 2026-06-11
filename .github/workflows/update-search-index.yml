@@ -1,0 +1,71 @@
+name: Update search index
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Sunday 00:30 JST.
+    - cron: "30 15 * * 6"
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade yt-dlp
+
+      - name: Build index
+        env:
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+        run: python work/scripts/build_index.py --all --comments-per-video 20
+
+      - name: Validate index
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path("outputs/omocoro-watch-search/data/search-index.json")
+          data = json.loads(path.read_text(encoding="utf-8"))
+          required = {
+              "videoId",
+              "title",
+              "url",
+              "thumbnail",
+              "publishedAt",
+              "description",
+              "tags",
+              "categories",
+              "chapters",
+              "additionalSearchFields",
+              "comments",
+              "transcriptSegments",
+          }
+          missing = [
+              (index, sorted(required - set(video)))
+              for index, video in enumerate(data.get("videos", []))
+              if required - set(video)
+          ]
+          if missing:
+              raise SystemExit(f"Missing required fields: {missing[:5]}")
+          if not data.get("videos"):
+              raise SystemExit("No videos found")
+          print(f"videos={len(data['videos'])}")
+          print(f"segments={sum(len(video['transcriptSegments']) for video in data['videos'])}")
+          PY
+
+      - name: Commit updated index
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Update Omocoro Watch search index"
+          file_pattern: outputs/omocoro-watch-search/data/search-index.json outputs/omocoro-watch-search/data/search-index.js

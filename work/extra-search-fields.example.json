@@ -1,0 +1,12 @@
+{
+  "videos": {
+    "F_1276apScM": [
+      {
+        "label": "外部API: サンプル",
+        "text": "別APIや手作業で作った補足テキストをここに入れると、この動画の検索対象に追加されます。",
+        "url": "https://example.com/source",
+        "weight": 20
+      }
+    ]
+  }
+}
