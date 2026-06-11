@@ -27,6 +27,7 @@ jobs:
       - name: Build index
         env:
           YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          SITE_URL: https://moyu1254.github.io/omocoro-watch-search/
         run: python work/scripts/build_index.py --all --comments-per-video 20
 
       - name: Validate index
@@ -68,4 +69,4 @@ jobs:
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "Update Omocoro Watch search index"
-          file_pattern: outputs/omocoro-watch-search/data/search-index.json outputs/omocoro-watch-search/data/search-index.js
+          file_pattern: outputs/omocoro-watch-search/data/search-index.json outputs/omocoro-watch-search/data/search-index.js outputs/omocoro-watch-search/videos.html outputs/omocoro-watch-search/sitemap.xml outputs/omocoro-watch-search/robots.txt

@@ -234,6 +234,36 @@ mark {
   text-align: center;
 }
 
+.video-list-page {
+  padding: 2rem 0 4rem;
+}
+
+.video-list-page h1 {
+  max-width: none;
+  font-size: clamp(2rem, 5vw, 3.2rem);
+}
+
+.video-list {
+  display: grid;
+  gap: 1rem;
+  margin-top: 2rem;
+}
+
+.video-list-item {
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 1rem;
+}
+
+.video-list-item h2 {
+  margin: 0;
+  font-size: 1.1rem;
+}
+
+.video-list-item p {
+  margin: 0.35rem 0 0;
+  color: var(--muted);
+}
+
 .sr-only {
   position: absolute;
   width: 1px;

@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://moyu1254.github.io/omocoro-watch-search/sitemap.xml

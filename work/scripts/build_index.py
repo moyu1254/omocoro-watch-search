@@ -19,6 +19,7 @@ from urllib.request import urlopen
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CHANNEL_URL = "https://www.youtube.com/@news_omocorowatch"
 DEFAULT_OUTPUT = ROOT / "outputs" / "omocoro-watch-search" / "data" / "search-index.json"
+DEFAULT_SITE_URL = "https://moyu1254.github.io/omocoro-watch-search/"
 YOUTUBE_API_BASE = "https://www.googleapis.com/youtube/v3"
 
 
@@ -104,6 +105,20 @@ def normalize_search_fields(values: Any, default_label: str) -> list[dict[str, A
             }
         )
     return fields
+
+
+def escape_html(value: str) -> str:
+    return (
+        str(value or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def public_url(site_url: str, path: str = "") -> str:
+    return site_url.rstrip("/") + "/" + path.lstrip("/")
 
 
 def normalize_chapters(values: Any) -> list[dict[str, Any]]:
@@ -247,6 +262,103 @@ def load_extra_search_fields(path: Path | None) -> dict[str, list[dict[str, Any]
     }
 
 
+def write_static_seo_files(payload: dict[str, Any], output: Path, site_url: str) -> None:
+    site_root = output.parent.parent
+    latest_modified = payload.get("generatedAt") or datetime.now(timezone.utc).isoformat()
+    videos = payload.get("videos", [])
+
+    rows: list[str] = []
+    item_list: list[dict[str, Any]] = []
+    for index, video in enumerate(videos, start=1):
+        title = escape_html(video.get("title") or "")
+        href = escape_html(video.get("url") or "")
+        published = escape_html(video.get("publishedAt") or "")
+        description = escape_html((video.get("description") or "")[:180])
+        rows.append(
+            '<article class="video-list-item">'
+            f'<h2><a href="{href}" target="_blank" rel="noreferrer">{title}</a></h2>'
+            f"<p>{published}</p>"
+            f"<p>{description}</p>"
+            "</article>"
+        )
+        item_list.append(
+            {
+                "@type": "ListItem",
+                "position": index,
+                "name": video.get("title") or "",
+                "url": video.get("url") or "",
+            }
+        )
+
+    list_json = json.dumps(
+        {
+            "@context": "https://schema.org",
+            "@type": "ItemList",
+            "name": "ニュース! オモコロウォッチ 収録回一覧",
+            "url": public_url(site_url, "videos.html"),
+            "numberOfItems": len(videos),
+            "itemListElement": item_list,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+    videos_html = f"""<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>収録回一覧 | オモコロウォッチのあの回</title>
+    <meta name="description" content="ニュース! オモコロウォッチの収録回一覧。タイトル、公開日、概要欄を掲載しています。">
+    <meta name="robots" content="index, follow">
+    <link rel="canonical" href="{escape_html(public_url(site_url, 'videos.html'))}">
+    <link rel="stylesheet" href="./styles.css">
+    <script type="application/ld+json">
+{list_json}
+    </script>
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="./index.html">オモコロウォッチのあの回</a>
+    </header>
+    <main class="video-list-page">
+      <h1>収録回一覧</h1>
+      <p class="source-links"><a href="./index.html">検索</a></p>
+      <div class="video-list">
+        {''.join(rows)}
+      </div>
+    </main>
+  </body>
+</html>
+"""
+    (site_root / "videos.html").write_text(videos_html, encoding="utf-8")
+
+    sitemap = f"""<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url>
+    <loc>{escape_html(public_url(site_url))}</loc>
+    <lastmod>{escape_html(latest_modified[:10])}</lastmod>
+    <changefreq>weekly</changefreq>
+    <priority>1.0</priority>
+  </url>
+  <url>
+    <loc>{escape_html(public_url(site_url, 'videos.html'))}</loc>
+    <lastmod>{escape_html(latest_modified[:10])}</lastmod>
+    <changefreq>weekly</changefreq>
+    <priority>0.8</priority>
+  </url>
+</urlset>
+"""
+    (site_root / "sitemap.xml").write_text(sitemap, encoding="utf-8")
+
+    robots = f"""User-agent: *
+Allow: /
+
+Sitemap: {public_url(site_url, 'sitemap.xml')}
+"""
+    (site_root / "robots.txt").write_text(robots, encoding="utf-8")
+
+
 def write_outputs(payload: dict[str, Any], output: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     json_text = json.dumps(payload, ensure_ascii=False, indent=2)
@@ -303,6 +415,7 @@ def build_index(
     youtube_api_key: str | None,
     comments_per_video: int,
     extra_search_json: Path | None,
+    site_url: str,
 ) -> dict[str, Any]:
     yt_dlp = load_yt_dlp()
     entries = fetch_playlist_entries(channel_url, max_videos)
@@ -388,6 +501,7 @@ def build_index(
     }
 
     write_outputs(payload, output)
+    write_static_seo_files(payload, output, site_url)
     return payload
 
 
@@ -401,6 +515,7 @@ def main() -> int:
     parser.add_argument("--youtube-api-key", default=os.environ.get("YOUTUBE_API_KEY", ""), help="Optional YouTube Data API key. Defaults to YOUTUBE_API_KEY.")
     parser.add_argument("--comments-per-video", type=int, default=0, help="Optional top-level YouTube comments to index per video. Requires --youtube-api-key.")
     parser.add_argument("--extra-search-json", type=Path, help="Optional JSON file with additional search fields keyed by video id.")
+    parser.add_argument("--site-url", default=os.environ.get("SITE_URL", DEFAULT_SITE_URL), help="Public site URL used in sitemap and structured data.")
     args = parser.parse_args()
 
     payload = build_index(
@@ -411,6 +526,7 @@ def main() -> int:
         youtube_api_key=args.youtube_api_key or None,
         comments_per_video=max(0, args.comments_per_video),
         extra_search_json=args.extra_search_json,
+        site_url=args.site_url,
     )
     print(f"Wrote {len(payload['videos'])} videos to {args.output}")
     return 0

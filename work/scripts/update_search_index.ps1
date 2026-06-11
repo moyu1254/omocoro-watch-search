@@ -1,7 +1,8 @@
 param(
   [string]$PythonExe = "C:\Users\moyuk\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe",
   [switch]$WithComments,
-  [int]$CommentsPerVideo = 20
+  [int]$CommentsPerVideo = 20,
+  [string]$SiteUrl = "https://moyu1254.github.io/omocoro-watch-search/"
 )
 
 $ErrorActionPreference = "Stop"
@@ -10,7 +11,7 @@ $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 $BuildScript = Join-Path $RepoRoot "work\scripts\build_index.py"
 $IndexPath = Join-Path $RepoRoot "outputs\omocoro-watch-search\data\search-index.json"
 
-$argsList = @($BuildScript, "--all")
+$argsList = @($BuildScript, "--all", "--site-url", $SiteUrl)
 if ($WithComments) {
   $argsList += @("--comments-per-video", $CommentsPerVideo)
 }

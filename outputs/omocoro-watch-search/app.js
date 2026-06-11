@@ -109,6 +109,20 @@ function renderLatestLink() {
   elements.latestLink.textContent = latest.title || latest.videoId;
 }
 
+function readQueryParam() {
+  return new URLSearchParams(window.location.search).get("q") || "";
+}
+
+function writeQueryParam(query) {
+  const url = new URL(window.location.href);
+  if (normalizeText(query)) {
+    url.searchParams.set("q", query);
+  } else {
+    url.searchParams.delete("q");
+  }
+  window.history.replaceState(null, "", url);
+}
+
 function countLabel(label, count) {
   return count ? `${label} ${Number(count).toLocaleString("ja-JP")}件` : "";
 }
@@ -317,11 +331,14 @@ async function loadIndex() {
 
 elements.form.addEventListener("submit", (event) => {
   event.preventDefault();
+  writeQueryParam(elements.query.value);
   renderResults(elements.query.value);
 });
 
 elements.query.addEventListener("input", () => {
+  writeQueryParam(elements.query.value);
   renderResults(elements.query.value);
 });
 
+elements.query.value = readQueryParam();
 loadIndex();
