@@ -310,7 +310,11 @@ def write_static_seo_files(payload: dict[str, Any], output: Path, site_url: str)
         {
             "@context": "https://schema.org",
             "@type": "ItemList",
-            "name": "ニュース! オモコロウォッチ 収録回一覧",
+            "name": "オモウォのあの回 回一覧",
+            "alternateName": [
+                "ニュース! オモコロウォッチ 収録回一覧",
+                "オモコロウォッチのあの回",
+            ],
             "url": public_url(site_url, "videos.html"),
             "numberOfItems": len(videos),
             "itemListElement": item_list,
@@ -322,8 +326,8 @@ def write_static_seo_files(payload: dict[str, Any], output: Path, site_url: str)
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>収録回一覧 | オモコロウォッチのあの回</title>
-    <meta name="description" content="ニュース! オモコロウォッチの収録回一覧。タイトル、公開日、概要欄を掲載しています。">
+    <title>回一覧 | オモウォのあの回</title>
+    <meta name="description" content="オモウォのあの回の回一覧。ニュース! オモコロウォッチのタイトル、公開日、概要欄を掲載しています。">
     <meta name="robots" content="index, follow">
     <link rel="canonical" href="{escape_html(public_url(site_url, 'videos.html'))}">
     <link rel="stylesheet" href="./styles.css">
@@ -333,10 +337,10 @@ def write_static_seo_files(payload: dict[str, Any], output: Path, site_url: str)
   </head>
   <body>
     <header class="site-header">
-      <a class="brand" href="./index.html">オモコロウォッチのあの回</a>
+      <a class="brand" href="./index.html">オモウォのあの回</a>
     </header>
     <main class="video-list-page">
-      <h1>収録回一覧</h1>
+      <h1>回一覧</h1>
       <p class="source-links"><a href="./index.html">検索</a></p>
       <div class="video-list">
         {''.join(rows)}
