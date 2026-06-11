@@ -12,7 +12,7 @@ import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode, unquote
+from urllib.parse import urlencode, unquote, urlparse
 from urllib.request import urlopen
 
 
@@ -96,12 +96,17 @@ def normalize_search_fields(values: Any, default_label: str) -> list[dict[str, A
         )
         if not text:
             continue
+        try:
+            weight = int(value.get("weight") or 15)
+        except (TypeError, ValueError):
+            weight = 15
+
         fields.append(
             {
                 "label": normalize_text(value.get("label") or value.get("source") or default_label),
                 "text": text,
                 "url": normalize_text(value.get("url") or ""),
-                "weight": int(value.get("weight") or 15),
+                "weight": weight,
             }
         )
     return fields
@@ -119,6 +124,17 @@ def escape_html(value: str) -> str:
 
 def public_url(site_url: str, path: str = "") -> str:
     return site_url.rstrip("/") + "/" + path.lstrip("/")
+
+
+def safe_href(value: str, fallback: str = "#") -> str:
+    parsed = urlparse(str(value or ""))
+    if parsed.scheme in ("http", "https"):
+        return str(value)
+    return fallback
+
+
+def script_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, indent=2).replace("</", "<\\/")
 
 
 def normalize_chapters(values: Any) -> list[dict[str, Any]]:
@@ -271,12 +287,12 @@ def write_static_seo_files(payload: dict[str, Any], output: Path, site_url: str)
     item_list: list[dict[str, Any]] = []
     for index, video in enumerate(videos, start=1):
         title = escape_html(video.get("title") or "")
-        href = escape_html(video.get("url") or "")
+        href = escape_html(safe_href(video.get("url") or ""))
         published = escape_html(video.get("publishedAt") or "")
         description = escape_html((video.get("description") or "")[:180])
         rows.append(
             '<article class="video-list-item">'
-            f'<h2><a href="{href}" target="_blank" rel="noreferrer">{title}</a></h2>'
+            f'<h2><a href="{href}" target="_blank" rel="noopener noreferrer">{title}</a></h2>'
             f"<p>{published}</p>"
             f"<p>{description}</p>"
             "</article>"
@@ -290,7 +306,7 @@ def write_static_seo_files(payload: dict[str, Any], output: Path, site_url: str)
             }
         )
 
-    list_json = json.dumps(
+    list_json = script_json(
         {
             "@context": "https://schema.org",
             "@type": "ItemList",
@@ -298,9 +314,7 @@ def write_static_seo_files(payload: dict[str, Any], output: Path, site_url: str)
             "url": public_url(site_url, "videos.html"),
             "numberOfItems": len(videos),
             "itemListElement": item_list,
-        },
-        ensure_ascii=False,
-        indent=2,
+        }
     )
 
     videos_html = f"""<!doctype html>

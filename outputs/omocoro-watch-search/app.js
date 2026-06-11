@@ -34,6 +34,19 @@ function escapeHtml(value) {
   }[char]));
 }
 
+function safeUrl(value, fallback = "#") {
+  if (!String(value || "").trim()) return fallback;
+  try {
+    const url = new URL(String(value || ""), window.location.href);
+    if (url.protocol === "http:" || url.protocol === "https:") {
+      return url.href;
+    }
+  } catch {
+    // Use the fallback for malformed URLs.
+  }
+  return fallback;
+}
+
 function formatDate(value) {
   if (!value) return "公開日不明";
   const date = new Date(value);
@@ -97,7 +110,7 @@ function makeSnippet(text, query) {
 }
 
 function buildVideoUrl(video, seconds = 0) {
-  const base = video.url || `https://www.youtube.com/watch?v=${video.videoId}`;
+  const base = safeUrl(video.url || `https://www.youtube.com/watch?v=${video.videoId}`);
   if (!seconds) return base;
   return `https://www.youtube.com/watch?v=${encodeURIComponent(video.videoId)}&t=${Math.floor(seconds)}s`;
 }
@@ -265,12 +278,12 @@ function renderResults(query) {
 
   elements.results.innerHTML = results.map(({ video, titleHit, fieldHits, chapterMatches, matches }) => `
     <article class="result-card">
-      <a class="thumb" href="${escapeHtml(buildVideoUrl(video))}" target="_blank" rel="noreferrer" aria-label="${escapeHtml(video.title)}をYouTubeで開く">
-        <img src="${escapeHtml(video.thumbnail || "")}" alt="" loading="lazy">
+      <a class="thumb" href="${escapeHtml(buildVideoUrl(video))}" target="_blank" rel="noopener noreferrer" aria-label="${escapeHtml(video.title)}をYouTubeで開く">
+        <img src="${escapeHtml(safeUrl(video.thumbnail || "", ""))}" alt="" loading="lazy">
       </a>
       <div>
         <h3 class="result-title">
-          <a href="${escapeHtml(buildVideoUrl(video))}" target="_blank" rel="noreferrer">
+          <a href="${escapeHtml(buildVideoUrl(video))}" target="_blank" rel="noopener noreferrer">
             ${titleHit ? highlight(video.title, query) : escapeHtml(video.title)}
           </a>
         </h3>
@@ -279,14 +292,14 @@ function renderResults(query) {
           <p class="field-hit">
             <span>${escapeHtml(hit.label)}</span>:
             ${hit.url
-              ? `<a href="${escapeHtml(hit.url)}" target="_blank" rel="noreferrer">${highlight(hit.text, query)}</a>`
+              ? `<a href="${escapeHtml(safeUrl(hit.url))}" target="_blank" rel="noopener noreferrer">${highlight(hit.text, query)}</a>`
               : highlight(hit.text, query)}
           </p>
         `).join("")}
         ${chapterMatches.length ? `
           <div class="match-list">
             ${chapterMatches.map((match) => `
-              <a class="match-link chapter-link" href="${escapeHtml(buildVideoUrl(video, match.start))}" target="_blank" rel="noreferrer">
+              <a class="match-link chapter-link" href="${escapeHtml(buildVideoUrl(video, match.start))}" target="_blank" rel="noopener noreferrer">
                 <strong>チャプター ${formatTime(match.start)}</strong> ${highlight(match.title, query)}
               </a>
             `).join("")}
@@ -295,7 +308,7 @@ function renderResults(query) {
         ${matches.length ? `
           <div class="match-list">
             ${matches.map((match) => `
-              <a class="match-link" href="${escapeHtml(buildVideoUrl(video, match.start))}" target="_blank" rel="noreferrer">
+              <a class="match-link" href="${escapeHtml(buildVideoUrl(video, match.start))}" target="_blank" rel="noopener noreferrer">
                 <strong>${formatTime(match.start)}</strong> ${highlight(match.text, query)}
               </a>
             `).join("")}
@@ -329,15 +342,14 @@ async function loadIndex() {
   }
 }
 
+function submitSearch() {
+  writeQueryParam(elements.query.value);
+  renderResults(elements.query.value);
+}
+
 elements.form.addEventListener("submit", (event) => {
   event.preventDefault();
-  writeQueryParam(elements.query.value);
-  renderResults(elements.query.value);
-});
-
-elements.query.addEventListener("input", () => {
-  writeQueryParam(elements.query.value);
-  renderResults(elements.query.value);
+  submitSearch();
 });
 
 elements.query.value = readQueryParam();
