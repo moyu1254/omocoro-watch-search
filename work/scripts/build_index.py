@@ -21,10 +21,23 @@ DEFAULT_CHANNEL_URL = "https://www.youtube.com/@news_omocorowatch"
 DEFAULT_OUTPUT = ROOT / "outputs" / "omocoro-watch-search" / "data" / "search-index.json"
 DEFAULT_SITE_URL = "https://moyu1254.github.io/omocoro-watch-search/"
 YOUTUBE_API_BASE = "https://www.googleapis.com/youtube/v3"
+YOUTUBE_UI_LANG_FALLBACKS = {
+    "ja-JP": "ja",
+    "en-US": "en",
+    "en-GB": "en-GB",
+}
 
 
 def normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", unicodedata.normalize("NFKC", value or "")).strip()
+
+
+def preferred_youtube_lang(lang_order: list[str]) -> str:
+    for lang in lang_order:
+        candidate = YOUTUBE_UI_LANG_FALLBACKS.get(lang, lang)
+        if candidate:
+            return candidate
+    return "ja"
 
 
 def load_yt_dlp():
@@ -410,10 +423,15 @@ def fetch_transcript(ydl: Any, video_id: str, lang_order: list[str]) -> list[dic
 
 
 def fetch_playlist_entries(channel_url: str, max_videos: int | None) -> list[dict[str, Any]]:
+    return fetch_playlist_entries_for_lang(channel_url, max_videos, "ja")
+
+
+def fetch_playlist_entries_for_lang(channel_url: str, max_videos: int | None, youtube_lang: str) -> list[dict[str, Any]]:
     yt_dlp = load_yt_dlp()
     playlist_url = channel_url.rstrip("/") + "/videos"
     options = {
         "extract_flat": "in_playlist",
+        "extractor_args": {"youtube": {"lang": [youtube_lang]}},
         "ignoreerrors": True,
         "quiet": True,
         "skip_download": True,
@@ -436,13 +454,15 @@ def build_index(
     site_url: str,
 ) -> dict[str, Any]:
     yt_dlp = load_yt_dlp()
-    entries = fetch_playlist_entries(channel_url, max_videos)
+    youtube_lang = preferred_youtube_lang(lang_order)
+    entries = fetch_playlist_entries_for_lang(channel_url, max_videos, youtube_lang)
     video_ids = [entry.get("id") or entry.get("url") for entry in entries if entry.get("id") or entry.get("url")]
     api_fields = fetch_youtube_api_fields(video_ids, youtube_api_key)
     extra_fields = load_extra_search_fields(extra_search_json)
     videos: list[dict[str, Any]] = []
 
     options = {
+        "extractor_args": {"youtube": {"lang": [youtube_lang]}},
         "ignoreerrors": True,
         "no_warnings": True,
         "quiet": True,
