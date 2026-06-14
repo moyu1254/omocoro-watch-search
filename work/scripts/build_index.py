@@ -26,6 +26,7 @@ YOUTUBE_UI_LANG_FALLBACKS = {
     "en-US": "en",
     "en-GB": "en-GB",
 }
+JAPANESE_TEXT_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uff66-\uff9f]")
 
 
 def normalize_text(value: str) -> str:
@@ -38,6 +39,10 @@ def preferred_youtube_lang(lang_order: list[str]) -> str:
         if candidate:
             return candidate
     return "ja"
+
+
+def contains_japanese(value: str) -> bool:
+    return bool(JAPANESE_TEXT_RE.search(value or ""))
 
 
 def load_yt_dlp():
@@ -83,6 +88,46 @@ def normalize_list(values: Any) -> list[str]:
     if not isinstance(values, list):
         return []
     return [text for text in (normalize_text(str(value)) for value in values) if text]
+
+
+def first_non_empty_string(*values: Any) -> str:
+    for value in values:
+        text = normalize_text(str(value or ""))
+        if text:
+            return text
+    return ""
+
+
+def first_non_empty_list(*values: Any) -> list[str]:
+    for value in values:
+        items = normalize_list(value)
+        if items:
+            return items
+    return []
+
+
+def first_non_empty_chapters(*values: Any) -> list[dict[str, Any]]:
+    for value in values:
+        items = normalize_chapters(value)
+        if items:
+            return items
+    return []
+
+
+def choose_preferred_title(info_title: Any, entry_title: Any) -> str:
+    info_text = normalize_text(str(info_title or ""))
+    entry_text = normalize_text(str(entry_title or ""))
+
+    if info_text and entry_text:
+        info_has_japanese = contains_japanese(info_text)
+        entry_has_japanese = contains_japanese(entry_text)
+        if entry_has_japanese and not info_has_japanese:
+            return entry_text
+        if info_has_japanese and not entry_has_japanese:
+            return info_text
+        return info_text
+
+    return info_text or entry_text
 
 
 def normalize_search_fields(values: Any, default_label: str) -> list[dict[str, Any]]:
@@ -402,17 +447,37 @@ def write_outputs(payload: dict[str, Any], output: Path) -> None:
     )
 
 
-def fetch_transcript(ydl: Any, video_id: str, lang_order: list[str]) -> list[dict[str, Any]]:
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    info = ydl.extract_info(url, download=False)
-    if not info:
-        return []
+def iter_caption_tracks(captions: dict[str, Any], lang_order: list[str]):
+    seen: set[str] = set()
+
+    for lang in lang_order:
+        for key, candidates in captions.items():
+            if key in seen:
+                continue
+            if key == lang or key.startswith(f"{lang}-"):
+                seen.add(key)
+                yield candidates
+
+    for key, candidates in captions.items():
+        if key in seen:
+            continue
+        if key == "ja" or key.startswith("ja-"):
+            seen.add(key)
+            yield candidates
+
+    for key, candidates in captions.items():
+        if key in seen:
+            continue
+        seen.add(key)
+        yield candidates
+
+
+def fetch_transcript(ydl: Any, info: dict[str, Any], lang_order: list[str]) -> list[dict[str, Any]]:
     subtitles = info.get("subtitles") or {}
     automatic = info.get("automatic_captions") or {}
 
     for captions in (subtitles, automatic):
-        for lang in lang_order:
-            candidates = captions.get(lang) or []
+        for candidates in iter_caption_tracks(captions, lang_order):
             json3 = next((item for item in candidates if item.get("ext") == "json3"), None)
             if not json3:
                 continue
@@ -420,6 +485,51 @@ def fetch_transcript(ydl: Any, video_id: str, lang_order: list[str]) -> list[dic
             return parse_subtitle_json3(json.loads(data))
 
     return []
+
+
+def update_homepage_latest_link(payload: dict[str, Any], output: Path) -> None:
+    index_path = output.parent.parent / "index.html"
+    if not index_path.exists():
+        return
+
+    videos = payload.get("videos") or []
+    if not videos:
+        return
+
+    latest = videos[0]
+    latest_url = safe_href(latest.get("url") or "")
+    latest_title = escape_html(latest.get("title") or "")
+    html = index_path.read_text(encoding="utf-8")
+    html = re.sub(
+        r'(<a id="latest-link" href=")[^"]+(" target="_blank" rel="noopener noreferrer">)(.*?)(</a>)',
+        lambda match: f'{match.group(1)}{escape_html(latest_url)}{match.group(2)}{latest_title}{match.group(4)}',
+        html,
+        count=1,
+        flags=re.DOTALL,
+    )
+    index_path.write_text(html, encoding="utf-8")
+
+
+def validate_payload(payload: dict[str, Any]) -> None:
+    videos = payload.get("videos") or []
+    if not videos:
+        raise SystemExit("No videos found in generated search index.")
+
+    description_count = sum(1 for video in videos if normalize_text(video.get("description") or ""))
+    tags_count = sum(1 for video in videos if video.get("tags"))
+    transcript_count = sum(1 for video in videos if video.get("transcriptSegments"))
+
+    if description_count == 0:
+        raise SystemExit("Generated index has no descriptions. Aborting to avoid shipping a degraded search index.")
+    if tags_count == 0:
+        raise SystemExit("Generated index has no tags. Aborting to avoid shipping a degraded search index.")
+    if transcript_count == 0:
+        raise SystemExit("Generated index has no transcript segments. Aborting to avoid shipping a degraded search index.")
+
+    latest = videos[0]
+    latest_title = normalize_text(latest.get("title") or "")
+    if not latest_title:
+        raise SystemExit("Latest video title is empty.")
 
 
 def fetch_playlist_entries(channel_url: str, max_videos: int | None) -> list[dict[str, Any]]:
@@ -488,7 +598,7 @@ def build_index(
                 info = entry
 
             try:
-                transcript = fetch_transcript(ydl, video_id, lang_order)
+                transcript = fetch_transcript(ydl, info, lang_order)
             except Exception as exc:  # noqa: BLE001
                 print(f"  transcript failed: {exc}", file=sys.stderr)
                 transcript = []
@@ -503,18 +613,27 @@ def build_index(
                 *api_fields.get(video_id, []),
                 *extra_fields.get(video_id, []),
             ]
+            chosen_title = choose_preferred_title(info.get("title"), entry.get("title"))
+            if normalize_text(info.get("title") or "") != normalize_text(entry.get("title") or ""):
+                print(
+                    "  title mismatch:"
+                    f" entry={entry.get('title', '')!r}"
+                    f" info={info.get('title', '')!r}"
+                    f" chosen={chosen_title!r}",
+                    file=sys.stderr,
+                )
 
             videos.append(
                 {
                     "videoId": video_id,
-                    "title": normalize_text(info.get("title") or entry.get("title") or ""),
+                    "title": chosen_title,
                     "url": f"https://www.youtube.com/watch?v={video_id}",
                     "thumbnail": pick_thumbnail(info or entry),
                     "publishedAt": format_upload_date(info.get("upload_date") or entry.get("upload_date") or ""),
-                    "description": normalize_text(info.get("description") or ""),
-                    "tags": normalize_list(info.get("tags")),
-                    "categories": normalize_list(info.get("categories")),
-                    "chapters": normalize_chapters(info.get("chapters")),
+                    "description": first_non_empty_string(info.get("description"), entry.get("description")),
+                    "tags": first_non_empty_list(info.get("tags"), entry.get("tags")),
+                    "categories": first_non_empty_list(info.get("categories"), entry.get("categories")),
+                    "chapters": first_non_empty_chapters(info.get("chapters"), entry.get("chapters")),
                     "additionalSearchFields": additional_search_fields,
                     "comments": comments,
                     "transcriptSegments": transcript,
@@ -538,8 +657,10 @@ def build_index(
         "videos": videos,
     }
 
+    validate_payload(payload)
     write_outputs(payload, output)
     write_static_seo_files(payload, output, site_url)
+    update_homepage_latest_link(payload, output)
     return payload
 
 
