@@ -27,7 +27,7 @@ jobs:
       - name: Build index
         env:
           YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
-          SITE_URL: https://moyu1254.github.io/omocoro-watch-search/
+          SITE_URL: https://omowatch.com/
         run: python work/scripts/build_index.py --all --comments-per-video 20
 
       - name: Validate index
