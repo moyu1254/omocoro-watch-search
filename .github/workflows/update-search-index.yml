@@ -69,4 +69,4 @@ jobs:
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "Update Omocoro Watch search index"
-          file_pattern: outputs/omocoro-watch-search/data/search-index.json outputs/omocoro-watch-search/data/search-index.js outputs/omocoro-watch-search/videos.html outputs/omocoro-watch-search/sitemap.xml outputs/omocoro-watch-search/robots.txt
+          file_pattern: outputs/omocoro-watch-search/data/search-index.json outputs/omocoro-watch-search/data/search-index.js outputs/omocoro-watch-search/index.html outputs/omocoro-watch-search/about.html outputs/omocoro-watch-search/styles.css outputs/omocoro-watch-search/videos.html outputs/omocoro-watch-search/sitemap.xml outputs/omocoro-watch-search/robots.txt
