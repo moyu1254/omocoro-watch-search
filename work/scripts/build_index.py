@@ -90,6 +90,10 @@ def parse_subtitle_json3(payload: dict[str, Any]) -> list[dict[str, Any]]:
 def format_upload_date(value: str) -> str:
     if not value:
         return ""
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}T.*", value):
+        return value[:10]
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        return value
     if re.fullmatch(r"\d{8}", value):
         return f"{value[:4]}-{value[4:6]}-{value[6:]}"
     return value
@@ -107,7 +111,7 @@ def format_unix_date(value: Any) -> str:
 
 def pick_published_at(*sources: dict[str, Any]) -> str:
     for source in sources:
-        for key in ("upload_date", "release_date", "modified_date"):
+        for key in ("upload_date", "release_date", "modified_date", "publishedAt"):
             published = format_upload_date(str(source.get(key) or ""))
             if published:
                 return published
@@ -116,6 +120,13 @@ def pick_published_at(*sources: dict[str, Any]) -> str:
             if published:
                 return published
     return ""
+
+
+def first_non_empty_value_with_source(*items: tuple[Any, str]) -> tuple[Any, str]:
+    for value, source in items:
+        if has_search_value(value):
+            return value, source
+    return "", ""
 
 
 def normalize_list(values: Any) -> list[str]:
@@ -324,16 +335,84 @@ def topic_name(topic_url: str) -> str:
     return normalize_text(unquote(topic_url.rstrip("/").rsplit("/", 1)[-1]).replace("_", " "))
 
 
-def fetch_youtube_api_fields(video_ids: list[str], api_key: str | None) -> dict[str, list[dict[str, Any]]]:
+def pick_api_thumbnail(thumbnails: Any) -> str:
+    if not isinstance(thumbnails, dict):
+        return ""
+
+    ranked = []
+    for thumbnail in thumbnails.values():
+        if not isinstance(thumbnail, dict):
+            continue
+        url = normalize_text(thumbnail.get("url") or "")
+        if url:
+            ranked.append((int(thumbnail.get("width") or 0), url))
+    if not ranked:
+        return ""
+    return sorted(ranked)[-1][1]
+
+
+def parse_youtube_api_item(item: dict[str, Any]) -> dict[str, Any]:
+    snippet = item.get("snippet") or {}
+    localized = snippet.get("localized") or {}
+    topic_details = item.get("topicDetails") or {}
+    recording = item.get("recordingDetails") or {}
+    content = item.get("contentDetails") or {}
+    statistics = item.get("statistics") or {}
+    localizations = item.get("localizations") or {}
+
+    fields: list[dict[str, Any]] = []
+    for label, text, weight in (
+        ("API: ローカライズタイトル", localized.get("title"), 80),
+        ("API: ローカライズ概要欄", localized.get("description"), 20),
+        ("API: チャンネル名", snippet.get("channelTitle"), 10),
+        ("API: 既定言語", snippet.get("defaultLanguage") or snippet.get("defaultAudioLanguage"), 8),
+        ("API: カテゴリID", snippet.get("categoryId"), 12),
+        ("API: 撮影場所", recording.get("locationDescription"), 12),
+        ("API: 動画時間", content.get("duration"), 5),
+        ("API: 再生数", statistics.get("viewCount"), 4),
+        ("API: コメント数", statistics.get("commentCount"), 4),
+    ):
+        text = normalize_text(text or "")
+        if text:
+            fields.append({"label": label, "text": text, "weight": weight})
+
+    for lang, localization in localizations.items():
+        if not isinstance(localization, dict):
+            continue
+        for key, label, weight in (
+            ("title", f"API: {lang} タイトル", 70),
+            ("description", f"API: {lang} 概要欄", 18),
+        ):
+            text = normalize_text(localization.get(key) or "")
+            if text:
+                fields.append({"label": label, "text": text, "weight": weight})
+
+    for topic_url in topic_details.get("topicCategories") or []:
+        text = topic_name(topic_url)
+        if text:
+            fields.append({"label": "API: トピック", "text": text, "url": topic_url, "weight": 18})
+
+    return {
+        "title": first_non_empty_string(localized.get("title"), snippet.get("title")),
+        "description": first_non_empty_string(localized.get("description"), snippet.get("description")),
+        "publishedAt": format_upload_date(snippet.get("publishedAt") or ""),
+        "thumbnail": pick_api_thumbnail(snippet.get("thumbnails")),
+        "tags": normalize_list(snippet.get("tags")),
+        "categoryId": normalize_text(snippet.get("categoryId") or ""),
+        "additionalSearchFields": fields,
+    }
+
+
+def fetch_youtube_api_metadata(video_ids: list[str], api_key: str | None) -> dict[str, dict[str, Any]]:
     if not api_key:
         return {}
 
-    fields_by_video: dict[str, list[dict[str, Any]]] = {}
+    metadata_by_video: dict[str, dict[str, Any]] = {}
     for group in chunks(video_ids, 50):
         payload = request_json(
             f"{YOUTUBE_API_BASE}/videos",
             {
-                "part": "snippet,topicDetails,recordingDetails,contentDetails",
+                "part": "snippet,contentDetails,statistics,topicDetails,localizations,recordingDetails",
                 "id": ",".join(group),
                 "key": api_key,
                 "maxResults": 50,
@@ -343,34 +422,9 @@ def fetch_youtube_api_fields(video_ids: list[str], api_key: str | None) -> dict[
             video_id = item.get("id")
             if not video_id:
                 continue
+            metadata_by_video[video_id] = parse_youtube_api_item(item)
 
-            snippet = item.get("snippet") or {}
-            localized = snippet.get("localized") or {}
-            topic_details = item.get("topicDetails") or {}
-            recording = item.get("recordingDetails") or {}
-            content = item.get("contentDetails") or {}
-            fields: list[dict[str, Any]] = []
-
-            for label, text, weight in (
-                ("API: ローカライズタイトル", localized.get("title"), 80),
-                ("API: ローカライズ概要欄", localized.get("description"), 20),
-                ("API: チャンネル名", snippet.get("channelTitle"), 10),
-                ("API: 既定言語", snippet.get("defaultLanguage") or snippet.get("defaultAudioLanguage"), 8),
-                ("API: 撮影場所", recording.get("locationDescription"), 12),
-                ("API: 動画時間", content.get("duration"), 5),
-            ):
-                text = normalize_text(text or "")
-                if text:
-                    fields.append({"label": label, "text": text, "weight": weight})
-
-            for topic_url in topic_details.get("topicCategories") or []:
-                text = topic_name(topic_url)
-                if text:
-                    fields.append({"label": "API: トピック", "text": text, "url": topic_url, "weight": 18})
-
-            fields_by_video[video_id] = fields
-
-    return fields_by_video
+    return metadata_by_video
 
 
 def fetch_youtube_api_comments(video_id: str, api_key: str | None, limit: int) -> list[dict[str, Any]]:
@@ -739,13 +793,14 @@ def build_index(
     entries = fetch_playlist_entries_for_lang(channel_url, max_videos, youtube_lang)
     video_ids = [entry.get("id") or entry.get("url") for entry in entries if entry.get("id") or entry.get("url")]
     try:
-        api_fields = fetch_youtube_api_fields(video_ids, youtube_api_key)
+        api_metadata = fetch_youtube_api_metadata(video_ids, youtube_api_key)
     except Exception as exc:  # noqa: BLE001 - keep yt-dlp-only updates usable.
-        print(f"YouTube API fields failed; continuing without API fields: {exc}", file=sys.stderr)
-        api_fields = {}
+        print(f"YouTube API metadata failed; continuing without API metadata: {exc}", file=sys.stderr)
+        api_metadata = {}
     extra_fields = load_extra_search_fields(extra_search_json)
     videos: list[dict[str, Any]] = []
     metadata_failed_count = 0
+    api_fallback_count = 0
     restored_video_count = 0
     restored_published_at_count = 0
     new_video_count = 0
@@ -796,11 +851,15 @@ def build_index(
                 print(f"  comments failed: {exc}", file=sys.stderr)
                 comments = []
 
+            api_video = api_metadata.get(video_id, {})
             additional_search_fields = [
-                *api_fields.get(video_id, []),
+                *(api_video.get("additionalSearchFields") or []),
                 *extra_fields.get(video_id, []),
             ]
-            chosen_title = choose_preferred_title(info.get("title"), entry.get("title"))
+            chosen_title, title_source = first_non_empty_value_with_source(
+                (choose_preferred_title(info.get("title"), entry.get("title")), "yt-dlp"),
+                (api_video.get("title"), "api"),
+            )
             if normalize_text(info.get("title") or "") != normalize_text(entry.get("title") or ""):
                 print(
                     "  title mismatch:"
@@ -810,14 +869,46 @@ def build_index(
                     file=sys.stderr,
                 )
 
+            description, description_source = first_non_empty_value_with_source(
+                (first_non_empty_string(info.get("description"), entry.get("description")), "yt-dlp"),
+                (api_video.get("description"), "api"),
+            )
+            tags, tags_source = first_non_empty_value_with_source(
+                (first_non_empty_list(info.get("tags"), entry.get("tags")), "yt-dlp"),
+                (api_video.get("tags"), "api"),
+            )
+            published_at, published_at_source = first_non_empty_value_with_source(
+                (pick_published_at(info, entry), "yt-dlp"),
+                (api_video.get("publishedAt"), "api"),
+            )
+            thumbnail = pick_thumbnail(info or entry)
+            thumbnail_source = "yt-dlp"
+            if api_video.get("thumbnail") and not ((info or {}).get("thumbnails") or entry.get("thumbnails")):
+                thumbnail = api_video["thumbnail"]
+                thumbnail_source = "api"
+            api_used_fields = [
+                field
+                for field, source in (
+                    ("title", title_source),
+                    ("description", description_source),
+                    ("tags", tags_source),
+                    ("publishedAt", published_at_source),
+                    ("thumbnail", thumbnail_source),
+                )
+                if source == "api"
+            ]
+            if api_used_fields:
+                api_fallback_count += 1
+                print(f"  filled from YouTube API: {', '.join(api_used_fields)}", file=sys.stderr)
+
             current_video = {
                 "videoId": video_id,
                 "title": chosen_title,
                 "url": f"https://www.youtube.com/watch?v={video_id}",
-                "thumbnail": pick_thumbnail(info or entry),
-                "publishedAt": pick_published_at(info, entry),
-                "description": first_non_empty_string(info.get("description"), entry.get("description")),
-                "tags": first_non_empty_list(info.get("tags"), entry.get("tags")),
+                "thumbnail": thumbnail,
+                "publishedAt": published_at,
+                "description": description,
+                "tags": tags,
                 "categories": first_non_empty_list(info.get("categories"), entry.get("categories")),
                 "chapters": first_non_empty_chapters(info.get("chapters"), entry.get("chapters")),
                 "additionalSearchFields": additional_search_fields,
@@ -864,6 +955,7 @@ def build_index(
     }
 
     print(f"metadataFailedVideos={metadata_failed_count}", file=sys.stderr)
+    print(f"apiFallbackVideos={api_fallback_count}", file=sys.stderr)
     print(f"restoredFromExistingVideos={restored_video_count}", file=sys.stderr)
     print(f"restoredPublishedAtVideos={restored_published_at_count}", file=sys.stderr)
     print(f"newVideos={new_video_count}", file=sys.stderr)
