@@ -88,8 +88,9 @@ h1 {
 }
 
 .search-form input:focus {
-  border-color: var(--accent);
-  outline: 3px solid rgba(233, 68, 46, 0.18);
+  border-color: #9f9a90;
+  outline: 3px solid rgba(106, 102, 94, 0.18);
+  box-shadow: 0 0 0 1px rgba(106, 102, 94, 0.08);
 }
 
 .search-form button {

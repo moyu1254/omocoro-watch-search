@@ -54,6 +54,11 @@ function formatDate(value) {
   return new Intl.DateTimeFormat("ja-JP", { dateStyle: "medium" }).format(date);
 }
 
+function dateRank(value) {
+  const date = new Date(value || "");
+  return Number.isNaN(date.getTime()) ? 0 : date.getTime();
+}
+
 function formatTime(seconds) {
   const safeSeconds = Math.max(0, Math.floor(Number(seconds) || 0));
   const mins = Math.floor(safeSeconds / 60);
@@ -266,7 +271,7 @@ function renderResults(query) {
   const results = state.videos
     .map((video) => scoreVideo(video, query))
     .filter(Boolean)
-    .sort((a, b) => b.score - a.score || new Date(b.video.publishedAt) - new Date(a.video.publishedAt));
+    .sort((a, b) => b.score - a.score || dateRank(b.video.publishedAt) - dateRank(a.video.publishedAt));
 
   elements.resultCount.textContent = `${results.length}件`;
   elements.status.textContent = `${results.length}件`;

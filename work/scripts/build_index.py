@@ -28,6 +28,7 @@ YOUTUBE_UI_LANG_FALLBACKS = {
 }
 JAPANESE_TEXT_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uff66-\uff9f]")
 PRESERVE_WHEN_EMPTY_FIELDS = [
+    "publishedAt",
     "description",
     "tags",
     "categories",
@@ -36,7 +37,7 @@ PRESERVE_WHEN_EMPTY_FIELDS = [
     "comments",
     "transcriptSegments",
 ]
-CRITICAL_SEARCH_FIELDS = ["description", "tags", "transcriptSegments"]
+CRITICAL_SEARCH_FIELDS = ["description", "tags", "transcriptSegments", "publishedAt"]
 
 
 def normalize_text(value: str) -> str:
@@ -92,6 +93,29 @@ def format_upload_date(value: str) -> str:
     if re.fullmatch(r"\d{8}", value):
         return f"{value[:4]}-{value[4:6]}-{value[6:]}"
     return value
+
+
+def format_unix_date(value: Any) -> str:
+    try:
+        timestamp = int(value)
+    except (TypeError, ValueError):
+        return ""
+    if timestamp <= 0:
+        return ""
+    return datetime.fromtimestamp(timestamp, timezone.utc).date().isoformat()
+
+
+def pick_published_at(*sources: dict[str, Any]) -> str:
+    for source in sources:
+        for key in ("upload_date", "release_date", "modified_date"):
+            published = format_upload_date(str(source.get(key) or ""))
+            if published:
+                return published
+        for key in ("timestamp", "release_timestamp", "modified_timestamp"):
+            published = format_unix_date(source.get(key))
+            if published:
+                return published
+    return ""
 
 
 def normalize_list(values: Any) -> list[str]:
@@ -723,6 +747,7 @@ def build_index(
     videos: list[dict[str, Any]] = []
     metadata_failed_count = 0
     restored_video_count = 0
+    restored_published_at_count = 0
     new_video_count = 0
 
     options = {
@@ -790,7 +815,7 @@ def build_index(
                 "title": chosen_title,
                 "url": f"https://www.youtube.com/watch?v={video_id}",
                 "thumbnail": pick_thumbnail(info or entry),
-                "publishedAt": format_upload_date(info.get("upload_date") or entry.get("upload_date") or ""),
+                "publishedAt": pick_published_at(info, entry),
                 "description": first_non_empty_string(info.get("description"), entry.get("description")),
                 "tags": first_non_empty_list(info.get("tags"), entry.get("tags")),
                 "categories": first_non_empty_list(info.get("categories"), entry.get("categories")),
@@ -803,12 +828,14 @@ def build_index(
             merged_video, restored_fields = merge_video_with_existing(current_video, existing_video)
             if restored_fields:
                 restored_video_count += 1
+                if "publishedAt" in restored_fields:
+                    restored_published_at_count += 1
                 print(f"  restored from existing index: {', '.join(restored_fields)}", file=sys.stderr)
             elif not existing_video:
                 new_video_count += 1
                 sparse_fields = [
                     field
-                    for field in ("description", "tags", "categories", "transcriptSegments")
+                    for field in ("publishedAt", "description", "tags", "categories", "transcriptSegments")
                     if not has_search_value(current_video.get(field))
                 ]
                 if sparse_fields:
@@ -838,6 +865,7 @@ def build_index(
 
     print(f"metadataFailedVideos={metadata_failed_count}", file=sys.stderr)
     print(f"restoredFromExistingVideos={restored_video_count}", file=sys.stderr)
+    print(f"restoredPublishedAtVideos={restored_published_at_count}", file=sys.stderr)
     print(f"newVideos={new_video_count}", file=sys.stderr)
 
     validate_payload(payload, existing_payload)
