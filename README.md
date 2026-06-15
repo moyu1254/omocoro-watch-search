@@ -2,7 +2,7 @@
 
 `オモウォのあの回` は、YouTube チャンネル「ニュース! オモコロウォッチ」の動画を、タイトル・概要欄・字幕・タグ・コメントなどから検索できる静的サイトです。
 
-- 公開サイト: https://moyu1254.github.io/omocoro-watch-search/
+- 公開サイト: https://omowatch.com/
 - 参考: https://tokura.app/
 
 ## 特徴
