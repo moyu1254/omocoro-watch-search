@@ -2,7 +2,7 @@ param(
   [string]$PythonExe = "C:\Users\moyuk\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe",
   [switch]$WithComments,
   [int]$CommentsPerVideo = 20,
-  [string]$SiteUrl = "https://moyu1254.github.io/omocoro-watch-search/"
+  [string]$SiteUrl = "https://omowatch.com/"
 )
 
 $ErrorActionPreference = "Stop"

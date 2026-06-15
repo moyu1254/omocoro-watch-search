@@ -19,7 +19,7 @@ from urllib.request import urlopen
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CHANNEL_URL = "https://www.youtube.com/@news_omocorowatch"
 DEFAULT_OUTPUT = ROOT / "outputs" / "omocoro-watch-search" / "data" / "search-index.json"
-DEFAULT_SITE_URL = "https://moyu1254.github.io/omocoro-watch-search/"
+DEFAULT_SITE_URL = "https://omowatch.com/"
 YOUTUBE_API_BASE = "https://www.googleapis.com/youtube/v3"
 YOUTUBE_UI_LANG_FALLBACKS = {
     "ja-JP": "ja",
@@ -27,6 +27,16 @@ YOUTUBE_UI_LANG_FALLBACKS = {
     "en-GB": "en-GB",
 }
 JAPANESE_TEXT_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uff66-\uff9f]")
+PRESERVE_WHEN_EMPTY_FIELDS = [
+    "description",
+    "tags",
+    "categories",
+    "chapters",
+    "additionalSearchFields",
+    "comments",
+    "transcriptSegments",
+]
+CRITICAL_SEARCH_FIELDS = ["description", "tags", "transcriptSegments"]
 
 
 def normalize_text(value: str) -> str:
@@ -112,6 +122,66 @@ def first_non_empty_chapters(*values: Any) -> list[dict[str, Any]]:
         if items:
             return items
     return []
+
+
+def has_search_value(value: Any) -> bool:
+    if isinstance(value, str):
+        return bool(normalize_text(value))
+    if isinstance(value, list):
+        return bool(value)
+    return value not in (None, "", [])
+
+
+def load_existing_payload(output: Path) -> dict[str, Any]:
+    if not output.exists():
+        return {}
+    try:
+        data = json.loads(output.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"Existing index could not be loaded; continuing without merge: {exc}", file=sys.stderr)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def videos_by_id(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    videos = payload.get("videos") or []
+    if not isinstance(videos, list):
+        return {}
+    return {
+        str(video.get("videoId")): video
+        for video in videos
+        if isinstance(video, dict) and video.get("videoId")
+    }
+
+
+def merge_video_with_existing(
+    current: dict[str, Any],
+    existing: dict[str, Any] | None,
+) -> tuple[dict[str, Any], list[str]]:
+    if not existing:
+        return current, []
+
+    merged = {**existing, **current}
+    restored_fields: list[str] = []
+    for field in PRESERVE_WHEN_EMPTY_FIELDS:
+        if has_search_value(current.get(field)) or not has_search_value(existing.get(field)):
+            continue
+        merged[field] = existing.get(field)
+        restored_fields.append(field)
+    return merged, restored_fields
+
+
+def looks_like_flat_video_entry(info: dict[str, Any]) -> bool:
+    return not any(
+        (
+            has_search_value(info.get("description")),
+            has_search_value(info.get("tags")),
+            has_search_value(info.get("categories")),
+            has_search_value(info.get("chapters")),
+            has_search_value(info.get("subtitles")),
+            has_search_value(info.get("automatic_captions")),
+        )
+    )
 
 
 def choose_preferred_title(info_title: Any, entry_title: Any) -> str:
@@ -510,7 +580,77 @@ def update_homepage_latest_link(payload: dict[str, Any], output: Path) -> None:
     index_path.write_text(html, encoding="utf-8")
 
 
-def validate_payload(payload: dict[str, Any]) -> None:
+def update_homepage_site_url(output: Path, site_url: str) -> None:
+    index_path = output.parent.parent / "index.html"
+    if not index_path.exists():
+        return
+
+    root_url = public_url(site_url)
+    search_url = public_url(site_url, "?q={search_term_string}")
+    html = index_path.read_text(encoding="utf-8")
+    html = re.sub(
+        r'(<link rel="canonical" href=")[^"]+(">)',
+        lambda match: f'{match.group(1)}{escape_html(root_url)}{match.group(2)}',
+        html,
+        count=1,
+    )
+    html = re.sub(
+        r'(<meta property="og:url" content=")[^"]+(">)',
+        lambda match: f'{match.group(1)}{escape_html(root_url)}{match.group(2)}',
+        html,
+        count=1,
+    )
+    html = re.sub(
+        r'("url":\s*")[^"]+(")',
+        lambda match: f'{match.group(1)}{escape_html(root_url)}{match.group(2)}',
+        html,
+        count=1,
+    )
+    html = re.sub(
+        r'("target":\s*")[^"]+(")',
+        lambda match: f'{match.group(1)}{escape_html(search_url)}{match.group(2)}',
+        html,
+        count=1,
+    )
+    index_path.write_text(html, encoding="utf-8")
+
+
+def non_empty_count(videos: list[dict[str, Any]], field: str) -> int:
+    return sum(1 for video in videos if has_search_value(video.get(field)))
+
+
+def list_item_count(videos: list[dict[str, Any]], field: str) -> int:
+    return sum(len(video.get(field) or []) for video in videos if isinstance(video.get(field), list))
+
+
+def validate_against_existing(payload: dict[str, Any], existing_payload: dict[str, Any]) -> None:
+    existing_by_id = videos_by_id(existing_payload)
+    current_by_id = videos_by_id(payload)
+    overlap_ids = sorted(set(existing_by_id) & set(current_by_id))
+    if not overlap_ids:
+        return
+
+    existing_overlap = [existing_by_id[video_id] for video_id in overlap_ids]
+    current_overlap = [current_by_id[video_id] for video_id in overlap_ids]
+    for field in CRITICAL_SEARCH_FIELDS:
+        existing_count = non_empty_count(existing_overlap, field)
+        current_count = non_empty_count(current_overlap, field)
+        if current_count < existing_count:
+            raise SystemExit(
+                f"Generated index lost {field} coverage for existing videos: "
+                f"{current_count}/{existing_count}. Aborting to avoid shipping a degraded search index."
+            )
+
+    existing_segments = list_item_count(existing_overlap, "transcriptSegments")
+    current_segments = list_item_count(current_overlap, "transcriptSegments")
+    if existing_segments and current_segments < existing_segments * 0.9:
+        raise SystemExit(
+            "Generated index has sharply fewer transcript segments for existing videos: "
+            f"{current_segments}/{existing_segments}. Aborting to avoid shipping a degraded search index."
+        )
+
+
+def validate_payload(payload: dict[str, Any], existing_payload: dict[str, Any] | None = None) -> None:
     videos = payload.get("videos") or []
     if not videos:
         raise SystemExit("No videos found in generated search index.")
@@ -531,6 +671,9 @@ def validate_payload(payload: dict[str, Any]) -> None:
     if not latest_title:
         raise SystemExit("Latest video title is empty.")
 
+    if existing_payload:
+        validate_against_existing(payload, existing_payload)
+
 
 def fetch_playlist_entries(channel_url: str, max_videos: int | None) -> list[dict[str, Any]]:
     return fetch_playlist_entries_for_lang(channel_url, max_videos, "ja")
@@ -550,6 +693,8 @@ def fetch_playlist_entries_for_lang(channel_url: str, max_videos: int | None, yo
         options["playlistend"] = max_videos
     with yt_dlp.YoutubeDL(options) as ydl:
         info = ydl.extract_info(playlist_url, download=False)
+    if not info:
+        raise SystemExit("Unable to fetch playlist entries. Aborting without updating the search index.")
     return [entry for entry in info.get("entries", []) if entry]
 
 
@@ -565,11 +710,20 @@ def build_index(
 ) -> dict[str, Any]:
     yt_dlp = load_yt_dlp()
     youtube_lang = preferred_youtube_lang(lang_order)
+    existing_payload = load_existing_payload(output)
+    existing_videos = videos_by_id(existing_payload)
     entries = fetch_playlist_entries_for_lang(channel_url, max_videos, youtube_lang)
     video_ids = [entry.get("id") or entry.get("url") for entry in entries if entry.get("id") or entry.get("url")]
-    api_fields = fetch_youtube_api_fields(video_ids, youtube_api_key)
+    try:
+        api_fields = fetch_youtube_api_fields(video_ids, youtube_api_key)
+    except Exception as exc:  # noqa: BLE001 - keep yt-dlp-only updates usable.
+        print(f"YouTube API fields failed; continuing without API fields: {exc}", file=sys.stderr)
+        api_fields = {}
     extra_fields = load_extra_search_fields(extra_search_json)
     videos: list[dict[str, Any]] = []
+    metadata_failed_count = 0
+    restored_video_count = 0
+    new_video_count = 0
 
     options = {
         "extractor_args": {"youtube": {"lang": [youtube_lang]}},
@@ -588,14 +742,22 @@ def build_index(
                 continue
             print(f"[{index}/{len(entries)}] {video_id} {entry.get('title', '')}", file=sys.stderr)
 
+            metadata_failed = False
             try:
                 info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
             except Exception as exc:  # noqa: BLE001 - keep the rest of the channel usable.
                 print(f"  metadata failed: {exc}", file=sys.stderr)
+                metadata_failed = True
                 info = entry
             if not info:
                 print("  metadata unavailable; keeping flat playlist entry", file=sys.stderr)
+                metadata_failed = True
                 info = entry
+            elif looks_like_flat_video_entry(info):
+                print("  metadata incomplete; treating as flat playlist entry", file=sys.stderr)
+                metadata_failed = True
+            if metadata_failed:
+                metadata_failed_count += 1
 
             try:
                 transcript = fetch_transcript(ydl, info, lang_order)
@@ -623,22 +785,39 @@ def build_index(
                     file=sys.stderr,
                 )
 
-            videos.append(
-                {
-                    "videoId": video_id,
-                    "title": chosen_title,
-                    "url": f"https://www.youtube.com/watch?v={video_id}",
-                    "thumbnail": pick_thumbnail(info or entry),
-                    "publishedAt": format_upload_date(info.get("upload_date") or entry.get("upload_date") or ""),
-                    "description": first_non_empty_string(info.get("description"), entry.get("description")),
-                    "tags": first_non_empty_list(info.get("tags"), entry.get("tags")),
-                    "categories": first_non_empty_list(info.get("categories"), entry.get("categories")),
-                    "chapters": first_non_empty_chapters(info.get("chapters"), entry.get("chapters")),
-                    "additionalSearchFields": additional_search_fields,
-                    "comments": comments,
-                    "transcriptSegments": transcript,
-                }
-            )
+            current_video = {
+                "videoId": video_id,
+                "title": chosen_title,
+                "url": f"https://www.youtube.com/watch?v={video_id}",
+                "thumbnail": pick_thumbnail(info or entry),
+                "publishedAt": format_upload_date(info.get("upload_date") or entry.get("upload_date") or ""),
+                "description": first_non_empty_string(info.get("description"), entry.get("description")),
+                "tags": first_non_empty_list(info.get("tags"), entry.get("tags")),
+                "categories": first_non_empty_list(info.get("categories"), entry.get("categories")),
+                "chapters": first_non_empty_chapters(info.get("chapters"), entry.get("chapters")),
+                "additionalSearchFields": additional_search_fields,
+                "comments": comments,
+                "transcriptSegments": transcript,
+            }
+            existing_video = existing_videos.get(video_id)
+            merged_video, restored_fields = merge_video_with_existing(current_video, existing_video)
+            if restored_fields:
+                restored_video_count += 1
+                print(f"  restored from existing index: {', '.join(restored_fields)}", file=sys.stderr)
+            elif not existing_video:
+                new_video_count += 1
+                sparse_fields = [
+                    field
+                    for field in ("description", "tags", "categories", "transcriptSegments")
+                    if not has_search_value(current_video.get(field))
+                ]
+                if sparse_fields:
+                    print(
+                        "  new video has limited search data: "
+                        f"{', '.join(sparse_fields)}",
+                        file=sys.stderr,
+                    )
+            videos.append(merged_video)
 
     payload = {
         "generatedAt": datetime.now(timezone.utc).isoformat(),
@@ -657,9 +836,14 @@ def build_index(
         "videos": videos,
     }
 
-    validate_payload(payload)
+    print(f"metadataFailedVideos={metadata_failed_count}", file=sys.stderr)
+    print(f"restoredFromExistingVideos={restored_video_count}", file=sys.stderr)
+    print(f"newVideos={new_video_count}", file=sys.stderr)
+
+    validate_payload(payload, existing_payload)
     write_outputs(payload, output)
     write_static_seo_files(payload, output, site_url)
+    update_homepage_site_url(output, site_url)
     update_homepage_latest_link(payload, output)
     return payload
 
