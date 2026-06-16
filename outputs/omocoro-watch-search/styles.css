@@ -244,6 +244,7 @@ mark {
 }
 
 .video-list-page {
+  max-width: 960px;
   padding: 2rem 0 4rem;
 }
 
@@ -268,21 +269,55 @@ mark {
   display: grid;
   gap: 1rem;
   margin-top: 2rem;
+  min-width: 0;
+  width: 100%;
 }
 
 .video-list-item {
-  border-bottom: 1px solid var(--line);
-  padding-bottom: 1rem;
+  display: grid;
+  gap: 0.55rem;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--paper);
+  padding: 1rem;
+  overflow-wrap: anywhere;
+  box-shadow: 0 1px 0 rgba(22, 22, 22, 0.04);
 }
 
 .video-list-item h2 {
+  min-width: 0;
+  max-width: 100%;
   margin: 0;
   font-size: 1.1rem;
+  line-height: 1.45;
+}
+
+.video-list-item h2 a {
+  display: inline-block;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  text-decoration-thickness: 0.08em;
+  text-underline-offset: 0.18em;
 }
 
 .video-list-item p {
-  margin: 0.35rem 0 0;
+  min-width: 0;
+  max-width: 100%;
+  margin: 0;
   color: var(--muted);
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+
+.video-list-item p:first-of-type {
+  font-size: 0.86rem;
+  font-weight: 700;
+}
+
+.video-list-item p:last-child {
+  font-size: 0.95rem;
 }
 
 .sr-only {
@@ -316,5 +351,22 @@ mark {
   .results-heading {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .video-list-page {
+    padding: 1.5rem 0 3rem;
+  }
+
+  .video-list {
+    gap: 0.8rem;
+    margin-top: 1.25rem;
+  }
+
+  .video-list-item {
+    padding: 0.9rem;
+  }
+
+  .video-list-item h2 {
+    font-size: 1rem;
   }
 }
