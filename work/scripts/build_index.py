@@ -225,6 +225,65 @@ def normalize_search_fields(values: Any, default_label: str) -> list[dict[str, A
     return fields
 
 
+def build_search_text(video: dict[str, Any]) -> str:
+    parts: list[str] = [
+        str(video.get("title") or ""),
+        str(video.get("description") or ""),
+    ]
+    parts.extend(str(value) for value in video.get("tags") or [])
+    parts.extend(str(value) for value in video.get("categories") or [])
+    parts.extend(str(chapter.get("title") or "") for chapter in video.get("chapters") or [] if isinstance(chapter, dict))
+    parts.extend(
+        str(field.get("text") or field.get("value") or field.get("title") or field.get("body") or "")
+        for field in video.get("additionalSearchFields") or []
+        if isinstance(field, dict)
+    )
+    parts.extend(
+        str(comment.get("text") or "")
+        for comment in video.get("comments") or []
+        if isinstance(comment, dict)
+    )
+    parts.extend(
+        str(segment.get("text") or "")
+        for segment in video.get("transcriptSegments") or []
+        if isinstance(segment, dict)
+    )
+    return normalize_text(" ".join(part for part in parts if part)).casefold()
+
+
+def payload_statistics(payload: dict[str, Any], output: Path) -> dict[str, Any]:
+    videos = payload.get("videos") or []
+    total_videos = len(videos)
+    total_transcript_segments = list_item_count(videos, "transcriptSegments")
+    return {
+        "indexFileSizeBytes": output.stat().st_size if output.exists() else 0,
+        "totalVideos": total_videos,
+        "totalTranscriptSegments": total_transcript_segments,
+        "totalComments": list_item_count(videos, "comments"),
+        "averageTranscriptSegmentsPerVideo": (
+            round(total_transcript_segments / total_videos, 2) if total_videos else 0
+        ),
+        "videosWithoutTranscripts": sum(
+            1 for video in videos if not has_search_value(video.get("transcriptSegments"))
+        ),
+    }
+
+
+def print_payload_statistics(payload: dict[str, Any], output: Path) -> None:
+    stats = payload_statistics(payload, output)
+    size_mb = stats["indexFileSizeBytes"] / (1024 * 1024)
+    print(f"indexFileSizeBytes={stats['indexFileSizeBytes']}", file=sys.stderr)
+    print(f"indexFileSizeMB={size_mb:.2f}", file=sys.stderr)
+    print(f"totalVideos={stats['totalVideos']}", file=sys.stderr)
+    print(f"totalTranscriptSegments={stats['totalTranscriptSegments']}", file=sys.stderr)
+    print(f"totalComments={stats['totalComments']}", file=sys.stderr)
+    print(
+        f"averageTranscriptSegmentsPerVideo={stats['averageTranscriptSegmentsPerVideo']}",
+        file=sys.stderr,
+    )
+    print(f"videosWithoutTranscripts={stats['videosWithoutTranscripts']}", file=sys.stderr)
+
+
 def escape_html(value: str) -> str:
     return (
         str(value or "")
@@ -1026,8 +1085,9 @@ def build_index(
                 print(
                     "  new video has limited search data: "
                     f"{', '.join(sparse_fields)}",
-                    file=sys.stderr,
-                )
+                        file=sys.stderr,
+                    )
+        merged_video["searchText"] = build_search_text(merged_video)
         videos.append(merged_video)
 
     payload = {
@@ -1076,6 +1136,7 @@ def build_index(
 
     validate_payload(payload, existing_payload)
     write_outputs(payload, output)
+    print_payload_statistics(payload, output)
     write_static_seo_files(payload, output, site_url)
     update_homepage_site_url(output, site_url)
     update_homepage_latest_link(payload, output)
