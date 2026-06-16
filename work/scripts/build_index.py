@@ -12,12 +12,14 @@ import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError
 from urllib.parse import urlencode, unquote, urlparse
 from urllib.request import urlopen
 
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CHANNEL_URL = "https://www.youtube.com/@news_omocorowatch"
+DEFAULT_CHANNEL_HANDLE = "@news_omocorowatch"
 DEFAULT_OUTPUT = ROOT / "outputs" / "omocoro-watch-search" / "data" / "search-index.json"
 DEFAULT_SITE_URL = "https://omowatch.com/"
 YOUTUBE_API_BASE = "https://www.googleapis.com/youtube/v3"
@@ -26,7 +28,6 @@ YOUTUBE_UI_LANG_FALLBACKS = {
     "en-US": "en",
     "en-GB": "en-GB",
 }
-JAPANESE_TEXT_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uff66-\uff9f]")
 PRESERVE_WHEN_EMPTY_FIELDS = [
     "publishedAt",
     "description",
@@ -52,26 +53,14 @@ def preferred_youtube_lang(lang_order: list[str]) -> str:
     return "ja"
 
 
-def contains_japanese(value: str) -> bool:
-    return bool(JAPANESE_TEXT_RE.search(value or ""))
-
-
 def load_yt_dlp():
     try:
         import yt_dlp  # type: ignore
     except ImportError as exc:
         raise SystemExit(
-            "yt-dlp is required. Install it with: python -m pip install yt-dlp"
+            "yt-dlp is required for transcript extraction. Install it with: python -m pip install yt-dlp"
         ) from exc
     return yt_dlp
-
-
-def pick_thumbnail(entry: dict[str, Any]) -> str:
-    thumbnails = entry.get("thumbnails") or []
-    if thumbnails:
-        return sorted(thumbnails, key=lambda item: item.get("width") or 0)[-1].get("url") or ""
-    video_id = entry.get("id") or entry.get("display_id")
-    return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg" if video_id else ""
 
 
 def parse_subtitle_json3(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -99,36 +88,6 @@ def format_upload_date(value: str) -> str:
     return value
 
 
-def format_unix_date(value: Any) -> str:
-    try:
-        timestamp = int(value)
-    except (TypeError, ValueError):
-        return ""
-    if timestamp <= 0:
-        return ""
-    return datetime.fromtimestamp(timestamp, timezone.utc).date().isoformat()
-
-
-def pick_published_at(*sources: dict[str, Any]) -> str:
-    for source in sources:
-        for key in ("upload_date", "release_date", "modified_date", "publishedAt"):
-            published = format_upload_date(str(source.get(key) or ""))
-            if published:
-                return published
-        for key in ("timestamp", "release_timestamp", "modified_timestamp"):
-            published = format_unix_date(source.get(key))
-            if published:
-                return published
-    return ""
-
-
-def first_non_empty_value_with_source(*items: tuple[Any, str]) -> tuple[Any, str]:
-    for value, source in items:
-        if has_search_value(value):
-            return value, source
-    return "", ""
-
-
 def normalize_list(values: Any) -> list[str]:
     if not isinstance(values, list):
         return []
@@ -141,22 +100,6 @@ def first_non_empty_string(*values: Any) -> str:
         if text:
             return text
     return ""
-
-
-def first_non_empty_list(*values: Any) -> list[str]:
-    for value in values:
-        items = normalize_list(value)
-        if items:
-            return items
-    return []
-
-
-def first_non_empty_chapters(*values: Any) -> list[dict[str, Any]]:
-    for value in values:
-        items = normalize_chapters(value)
-        if items:
-            return items
-    return []
 
 
 def has_search_value(value: Any) -> bool:
@@ -204,35 +147,6 @@ def merge_video_with_existing(
         merged[field] = existing.get(field)
         restored_fields.append(field)
     return merged, restored_fields
-
-
-def looks_like_flat_video_entry(info: dict[str, Any]) -> bool:
-    return not any(
-        (
-            has_search_value(info.get("description")),
-            has_search_value(info.get("tags")),
-            has_search_value(info.get("categories")),
-            has_search_value(info.get("chapters")),
-            has_search_value(info.get("subtitles")),
-            has_search_value(info.get("automatic_captions")),
-        )
-    )
-
-
-def choose_preferred_title(info_title: Any, entry_title: Any) -> str:
-    info_text = normalize_text(str(info_title or ""))
-    entry_text = normalize_text(str(entry_title or ""))
-
-    if info_text and entry_text:
-        info_has_japanese = contains_japanese(info_text)
-        entry_has_japanese = contains_japanese(entry_text)
-        if entry_has_japanese and not info_has_japanese:
-            return entry_text
-        if info_has_japanese and not entry_has_japanese:
-            return info_text
-        return info_text
-
-    return info_text or entry_text
 
 
 def normalize_search_fields(values: Any, default_label: str) -> list[dict[str, Any]]:
@@ -300,35 +214,128 @@ def script_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2).replace("</", "<\\/")
 
 
-def normalize_chapters(values: Any) -> list[dict[str, Any]]:
-    if not isinstance(values, list):
-        return []
-
-    chapters: list[dict[str, Any]] = []
-    for chapter in values:
-        if not isinstance(chapter, dict):
-            continue
-        title = normalize_text(chapter.get("title") or "")
-        if not title:
-            continue
-        chapters.append(
-            {
-                "title": title,
-                "start": round(float(chapter.get("start_time") or 0), 3),
-                "end": round(float(chapter.get("end_time") or 0), 3),
-            }
-        )
-    return chapters
-
-
 def request_json(url: str, params: dict[str, Any]) -> dict[str, Any]:
     query = urlencode({key: value for key, value in params.items() if value not in (None, "")})
-    with urlopen(f"{url}?{query}", timeout=30) as response:
-        return json.loads(response.read().decode("utf-8", errors="replace"))
+    try:
+        with urlopen(f"{url}?{query}", timeout=30) as response:
+            return json.loads(response.read().decode("utf-8", errors="replace"))
+    except HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"YouTube Data API request failed: HTTP {exc.code} {body}") from exc
 
 
 def chunks(values: list[str], size: int) -> list[list[str]]:
     return [values[index:index + size] for index in range(0, len(values), size)]
+
+
+def extract_channel_handle(channel_url: str) -> str:
+    parsed = urlparse(channel_url or "")
+    path = parsed.path.strip("/")
+    if path.startswith("@"):
+        return path.split("/", 1)[0]
+    return ""
+
+
+def fetch_youtube_api_channel(
+    api_key: str,
+    channel_id: str,
+    channel_handle: str,
+) -> dict[str, str]:
+    params: dict[str, Any] = {
+        "part": "snippet,contentDetails",
+        "key": api_key,
+    }
+    if channel_id:
+        params["id"] = channel_id
+    elif channel_handle:
+        params["forHandle"] = channel_handle
+    else:
+        raise SystemExit("Either --channel-id, --channel-handle, or --channel-url with a handle is required.")
+
+    payload = request_json(f"{YOUTUBE_API_BASE}/channels", params)
+    items = payload.get("items") or []
+    if not items and params.get("forHandle", "").startswith("@"):
+        params["forHandle"] = params["forHandle"].lstrip("@")
+        payload = request_json(f"{YOUTUBE_API_BASE}/channels", params)
+        items = payload.get("items") or []
+    if not items:
+        raise SystemExit("YouTube Data API did not return a channel. Check the channel identifier.")
+
+    item = items[0]
+    snippet = item.get("snippet") or {}
+    related = (item.get("contentDetails") or {}).get("relatedPlaylists") or {}
+    resolved_channel_id = normalize_text(item.get("id") or channel_id)
+    uploads_playlist_id = normalize_text(related.get("uploads") or "")
+    if not uploads_playlist_id:
+        raise SystemExit("YouTube Data API response did not include an uploads playlist ID.")
+
+    return {
+        "id": resolved_channel_id,
+        "name": first_non_empty_string(snippet.get("title"), "ニュース! オモコロウォッチ"),
+        "url": f"https://www.youtube.com/channel/{resolved_channel_id}" if resolved_channel_id else DEFAULT_CHANNEL_URL,
+        "uploadsPlaylistId": uploads_playlist_id,
+    }
+
+
+def fetch_youtube_api_upload_video_ids(
+    uploads_playlist_id: str,
+    api_key: str,
+    max_videos: int | None,
+) -> list[str]:
+    video_ids: list[str] = []
+    page_token = ""
+    while True:
+        payload = request_json(
+            f"{YOUTUBE_API_BASE}/playlistItems",
+            {
+                "part": "contentDetails",
+                "playlistId": uploads_playlist_id,
+                "key": api_key,
+                "maxResults": 50,
+                "pageToken": page_token,
+            },
+        )
+        for item in payload.get("items") or []:
+            video_id = normalize_text((item.get("contentDetails") or {}).get("videoId") or "")
+            if video_id:
+                video_ids.append(video_id)
+                if max_videos and len(video_ids) >= max_videos:
+                    return video_ids
+        page_token = payload.get("nextPageToken") or ""
+        if not page_token:
+            break
+    return video_ids
+
+
+def parse_timecode(value: str) -> float | None:
+    parts = value.split(":")
+    if len(parts) not in (2, 3):
+        return None
+    try:
+        numbers = [int(part) for part in parts]
+    except ValueError:
+        return None
+    if len(numbers) == 2:
+        minutes, seconds = numbers
+        return float(minutes * 60 + seconds)
+    hours, minutes, seconds = numbers
+    return float(hours * 3600 + minutes * 60 + seconds)
+
+
+def extract_chapters_from_description(description: str) -> list[dict[str, Any]]:
+    chapters: list[dict[str, Any]] = []
+    for line in str(description or "").splitlines():
+        match = re.search(r"(?P<time>\d{1,2}:\d{2}(?::\d{2})?)\s+(?P<title>.+)", line)
+        if not match:
+            continue
+        start = parse_timecode(match.group("time"))
+        title = normalize_text(match.group("title"))
+        if start is None or not title:
+            continue
+        chapters.append({"title": title, "start": round(start, 3), "end": round(start, 3)})
+    for index, chapter in enumerate(chapters[:-1]):
+        chapter["end"] = chapters[index + 1]["start"]
+    return chapters
 
 
 def topic_name(topic_url: str) -> str:
@@ -392,21 +399,23 @@ def parse_youtube_api_item(item: dict[str, Any]) -> dict[str, Any]:
         if text:
             fields.append({"label": "API: トピック", "text": text, "url": topic_url, "weight": 18})
 
+    category_id = normalize_text(snippet.get("categoryId") or "")
+    description = first_non_empty_string(localized.get("description"), snippet.get("description"))
+
     return {
         "title": first_non_empty_string(localized.get("title"), snippet.get("title")),
-        "description": first_non_empty_string(localized.get("description"), snippet.get("description")),
+        "description": description,
         "publishedAt": format_upload_date(snippet.get("publishedAt") or ""),
         "thumbnail": pick_api_thumbnail(snippet.get("thumbnails")),
         "tags": normalize_list(snippet.get("tags")),
-        "categoryId": normalize_text(snippet.get("categoryId") or ""),
+        "categoryId": category_id,
+        "categories": [category_id] if category_id else [],
+        "chapters": extract_chapters_from_description(description),
         "additionalSearchFields": fields,
     }
 
 
-def fetch_youtube_api_metadata(video_ids: list[str], api_key: str | None) -> dict[str, dict[str, Any]]:
-    if not api_key:
-        return {}
-
+def fetch_youtube_api_metadata(video_ids: list[str], api_key: str) -> dict[str, dict[str, Any]]:
     metadata_by_video: dict[str, dict[str, Any]] = {}
     for group in chunks(video_ids, 50):
         payload = request_json(
@@ -427,8 +436,8 @@ def fetch_youtube_api_metadata(video_ids: list[str], api_key: str | None) -> dic
     return metadata_by_video
 
 
-def fetch_youtube_api_comments(video_id: str, api_key: str | None, limit: int) -> list[dict[str, Any]]:
-    if not api_key or limit <= 0:
+def fetch_youtube_api_comments(video_id: str, api_key: str, limit: int) -> list[dict[str, Any]]:
+    if limit <= 0:
         return []
 
     comments: list[dict[str, Any]] = []
@@ -652,7 +661,10 @@ def iter_caption_tracks(captions: dict[str, Any], lang_order: list[str]):
         yield candidates
 
 
-def fetch_transcript(ydl: Any, info: dict[str, Any], lang_order: list[str]) -> list[dict[str, Any]]:
+def fetch_transcript(ydl: Any, video_id: str, lang_order: list[str]) -> list[dict[str, Any]]:
+    info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+    if not info:
+        return []
     subtitles = info.get("subtitles") or {}
     automatic = info.get("automatic_captions") or {}
 
@@ -785,31 +797,11 @@ def validate_payload(payload: dict[str, Any], existing_payload: dict[str, Any] |
         validate_against_existing(payload, existing_payload)
 
 
-def fetch_playlist_entries(channel_url: str, max_videos: int | None) -> list[dict[str, Any]]:
-    return fetch_playlist_entries_for_lang(channel_url, max_videos, "ja")
-
-
-def fetch_playlist_entries_for_lang(channel_url: str, max_videos: int | None, youtube_lang: str) -> list[dict[str, Any]]:
-    yt_dlp = load_yt_dlp()
-    playlist_url = channel_url.rstrip("/") + "/videos"
-    options = {
-        "extract_flat": "in_playlist",
-        "extractor_args": {"youtube": {"lang": [youtube_lang]}},
-        "ignoreerrors": True,
-        "quiet": True,
-        "skip_download": True,
-    }
-    if max_videos:
-        options["playlistend"] = max_videos
-    with yt_dlp.YoutubeDL(options) as ydl:
-        info = ydl.extract_info(playlist_url, download=False)
-    if not info:
-        raise SystemExit("Unable to fetch playlist entries. Aborting without updating the search index.")
-    return [entry for entry in info.get("entries", []) if entry]
-
-
 def build_index(
     channel_url: str,
+    channel_id: str,
+    channel_handle: str,
+    uploads_playlist_id: str,
     output: Path,
     max_videos: int | None,
     lang_order: list[str],
@@ -820,21 +812,33 @@ def build_index(
 ) -> dict[str, Any]:
     yt_dlp = load_yt_dlp()
     youtube_lang = preferred_youtube_lang(lang_order)
+    if not youtube_api_key:
+        raise SystemExit("YOUTUBE_API_KEY is required. YouTube Data API is the primary data source.")
+
     existing_payload = load_existing_payload(output)
     existing_videos = videos_by_id(existing_payload)
-    entries = fetch_playlist_entries_for_lang(channel_url, max_videos, youtube_lang)
-    video_ids = [entry.get("id") or entry.get("url") for entry in entries if entry.get("id") or entry.get("url")]
-    try:
-        api_metadata = fetch_youtube_api_metadata(video_ids, youtube_api_key)
-    except Exception as exc:  # noqa: BLE001 - keep yt-dlp-only updates usable.
-        print(f"YouTube API metadata failed; continuing without API metadata: {exc}", file=sys.stderr)
-        api_metadata = {}
+    resolved_handle = channel_handle or extract_channel_handle(channel_url)
+    channel = (
+        {
+            "id": channel_id,
+            "name": "ニュース! オモコロウォッチ",
+            "url": f"https://www.youtube.com/channel/{channel_id}" if channel_id else (channel_url or DEFAULT_CHANNEL_URL),
+            "uploadsPlaylistId": uploads_playlist_id,
+        }
+        if uploads_playlist_id
+        else fetch_youtube_api_channel(youtube_api_key, channel_id, resolved_handle)
+    )
+    video_ids = fetch_youtube_api_upload_video_ids(channel["uploadsPlaylistId"], youtube_api_key, max_videos)
+    if not video_ids:
+        raise SystemExit("YouTube Data API returned no videos from the uploads playlist.")
+
+    api_metadata = fetch_youtube_api_metadata(video_ids, youtube_api_key)
     extra_fields = load_extra_search_fields(extra_search_json)
     videos: list[dict[str, Any]] = []
-    metadata_failed_count = 0
-    api_fallback_count = 0
+    missing_api_metadata_count = 0
+    transcript_failed_count = 0
+    comments_failed_count = 0
     restored_video_count = 0
-    restored_published_at_count = 0
     new_video_count = 0
 
     options = {
@@ -848,111 +852,59 @@ def build_index(
     }
 
     with yt_dlp.YoutubeDL(options) as ydl:
-        for index, entry in enumerate(entries, start=1):
-            video_id = entry.get("id") or entry.get("url")
-            if not video_id:
+        for index, video_id in enumerate(video_ids, start=1):
+            api_video = api_metadata.get(video_id)
+            if not api_video:
+                missing_api_metadata_count += 1
+                print(f"[{index}/{len(video_ids)}] {video_id} API metadata missing; skipping", file=sys.stderr)
                 continue
-            print(f"[{index}/{len(entries)}] {video_id} {entry.get('title', '')}", file=sys.stderr)
-
-            metadata_failed = False
-            try:
-                info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
-            except Exception as exc:  # noqa: BLE001 - keep the rest of the channel usable.
-                print(f"  metadata failed: {exc}", file=sys.stderr)
-                metadata_failed = True
-                info = entry
-            if not info:
-                print("  metadata unavailable; keeping flat playlist entry", file=sys.stderr)
-                metadata_failed = True
-                info = entry
-            elif looks_like_flat_video_entry(info):
-                print("  metadata incomplete; treating as flat playlist entry", file=sys.stderr)
-                metadata_failed = True
-            if metadata_failed:
-                metadata_failed_count += 1
+            print(f"[{index}/{len(video_ids)}] {video_id} {api_video.get('title', '')}", file=sys.stderr)
 
             try:
-                transcript = fetch_transcript(ydl, info, lang_order)
+                transcript = fetch_transcript(ydl, video_id, lang_order)
             except Exception as exc:  # noqa: BLE001
                 print(f"  transcript failed: {exc}", file=sys.stderr)
+                transcript_failed_count += 1
                 transcript = []
 
             try:
                 comments = fetch_youtube_api_comments(video_id, youtube_api_key, comments_per_video)
             except Exception as exc:  # noqa: BLE001
                 print(f"  comments failed: {exc}", file=sys.stderr)
+                comments_failed_count += 1
                 comments = []
 
-            api_video = api_metadata.get(video_id, {})
             additional_search_fields = [
                 *(api_video.get("additionalSearchFields") or []),
                 *extra_fields.get(video_id, []),
             ]
-            chosen_title, title_source = first_non_empty_value_with_source(
-                (choose_preferred_title(info.get("title"), entry.get("title")), "yt-dlp"),
-                (api_video.get("title"), "api"),
-            )
-            if normalize_text(info.get("title") or "") != normalize_text(entry.get("title") or ""):
-                print(
-                    "  title mismatch:"
-                    f" entry={entry.get('title', '')!r}"
-                    f" info={info.get('title', '')!r}"
-                    f" chosen={chosen_title!r}",
-                    file=sys.stderr,
-                )
-
-            description, description_source = first_non_empty_value_with_source(
-                (first_non_empty_string(info.get("description"), entry.get("description")), "yt-dlp"),
-                (api_video.get("description"), "api"),
-            )
-            tags, tags_source = first_non_empty_value_with_source(
-                (first_non_empty_list(info.get("tags"), entry.get("tags")), "yt-dlp"),
-                (api_video.get("tags"), "api"),
-            )
-            published_at, published_at_source = first_non_empty_value_with_source(
-                (pick_published_at(info, entry), "yt-dlp"),
-                (api_video.get("publishedAt"), "api"),
-            )
-            thumbnail = pick_thumbnail(info or entry)
-            thumbnail_source = "yt-dlp"
-            if api_video.get("thumbnail") and not ((info or {}).get("thumbnails") or entry.get("thumbnails")):
-                thumbnail = api_video["thumbnail"]
-                thumbnail_source = "api"
-            api_used_fields = [
-                field
-                for field, source in (
-                    ("title", title_source),
-                    ("description", description_source),
-                    ("tags", tags_source),
-                    ("publishedAt", published_at_source),
-                    ("thumbnail", thumbnail_source),
-                )
-                if source == "api"
-            ]
-            if api_used_fields:
-                api_fallback_count += 1
-                print(f"  filled from YouTube API: {', '.join(api_used_fields)}", file=sys.stderr)
+            existing_video = existing_videos.get(video_id)
+            chapters = api_video.get("chapters") or []
+            existing_chapters = existing_video.get("chapters") if existing_video else []
+            if (
+                isinstance(existing_chapters, list)
+                and len(existing_chapters) > len(chapters)
+                and has_search_value(existing_chapters)
+            ):
+                chapters = []
 
             current_video = {
                 "videoId": video_id,
-                "title": chosen_title,
+                "title": api_video.get("title") or "",
                 "url": f"https://www.youtube.com/watch?v={video_id}",
-                "thumbnail": thumbnail,
-                "publishedAt": published_at,
-                "description": description,
-                "tags": tags,
-                "categories": first_non_empty_list(info.get("categories"), entry.get("categories")),
-                "chapters": first_non_empty_chapters(info.get("chapters"), entry.get("chapters")),
+                "thumbnail": api_video.get("thumbnail") or f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+                "publishedAt": api_video.get("publishedAt") or "",
+                "description": api_video.get("description") or "",
+                "tags": api_video.get("tags") or [],
+                "categories": api_video.get("categories") or [],
+                "chapters": chapters,
                 "additionalSearchFields": additional_search_fields,
                 "comments": comments,
                 "transcriptSegments": transcript,
             }
-            existing_video = existing_videos.get(video_id)
             merged_video, restored_fields = merge_video_with_existing(current_video, existing_video)
             if restored_fields:
                 restored_video_count += 1
-                if "publishedAt" in restored_fields:
-                    restored_published_at_count += 1
                 print(f"  restored from existing index: {', '.join(restored_fields)}", file=sys.stderr)
             elif not existing_video:
                 new_video_count += 1
@@ -972,24 +924,24 @@ def build_index(
     payload = {
         "generatedAt": datetime.now(timezone.utc).isoformat(),
         "channel": {
-            "name": "ニュース! オモコロウォッチ",
-            "url": channel_url,
+            "name": channel["name"],
+            "url": channel["url"],
         },
         "source": {
-            "tool": "yt-dlp",
+            "tool": "youtube-data-api",
+            "transcriptTool": "yt-dlp",
             "maxVideos": max_videos,
             "subtitleLanguages": lang_order,
-            "youtubeDataApi": bool(youtube_api_key),
-            "commentsPerVideo": comments_per_video if youtube_api_key else 0,
+            "commentsPerVideo": comments_per_video,
             "extraSearchJson": str(extra_search_json) if extra_search_json else "",
         },
         "videos": videos,
     }
 
-    print(f"metadataFailedVideos={metadata_failed_count}", file=sys.stderr)
-    print(f"apiFallbackVideos={api_fallback_count}", file=sys.stderr)
+    print(f"missingApiMetadataVideos={missing_api_metadata_count}", file=sys.stderr)
+    print(f"transcriptFailedVideos={transcript_failed_count}", file=sys.stderr)
+    print(f"commentsFailedVideos={comments_failed_count}", file=sys.stderr)
     print(f"restoredFromExistingVideos={restored_video_count}", file=sys.stderr)
-    print(f"restoredPublishedAtVideos={restored_published_at_count}", file=sys.stderr)
     print(f"newVideos={new_video_count}", file=sys.stderr)
 
     validate_payload(payload, existing_payload)
@@ -1002,19 +954,25 @@ def build_index(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--channel-url", default=DEFAULT_CHANNEL_URL)
+    parser.add_argument("--channel-url", default=DEFAULT_CHANNEL_URL, help="Compatibility helper used to derive a channel handle when possible.")
+    parser.add_argument("--channel-id", default=os.environ.get("YOUTUBE_CHANNEL_ID", ""), help="YouTube channel ID. Optional when --channel-handle or --uploads-playlist-id is set.")
+    parser.add_argument("--channel-handle", default=os.environ.get("YOUTUBE_CHANNEL_HANDLE", DEFAULT_CHANNEL_HANDLE), help="YouTube channel handle used with channels.list.")
+    parser.add_argument("--uploads-playlist-id", default=os.environ.get("YOUTUBE_UPLOADS_PLAYLIST_ID", ""), help="Uploads playlist ID. Skips channels.list when set.")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--max-videos", type=int, default=30)
     parser.add_argument("--all", action="store_true", help="Fetch every video currently listed on the channel.")
     parser.add_argument("--languages", default="ja,ja-JP,en", help="Comma-separated subtitle language preference order.")
-    parser.add_argument("--youtube-api-key", default=os.environ.get("YOUTUBE_API_KEY", ""), help="Optional YouTube Data API key. Defaults to YOUTUBE_API_KEY.")
-    parser.add_argument("--comments-per-video", type=int, default=0, help="Optional top-level YouTube comments to index per video. Requires --youtube-api-key.")
+    parser.add_argument("--youtube-api-key", default=os.environ.get("YOUTUBE_API_KEY", ""), help="Required YouTube Data API key. Defaults to YOUTUBE_API_KEY.")
+    parser.add_argument("--comments-per-video", type=int, default=0, help="Top-level YouTube comments to index per video. Use 0 to skip commentThreads.list.")
     parser.add_argument("--extra-search-json", type=Path, help="Optional JSON file with additional search fields keyed by video id.")
     parser.add_argument("--site-url", default=os.environ.get("SITE_URL", DEFAULT_SITE_URL), help="Public site URL used in sitemap and structured data.")
     args = parser.parse_args()
 
     payload = build_index(
         channel_url=args.channel_url,
+        channel_id=args.channel_id,
+        channel_handle=args.channel_handle,
+        uploads_playlist_id=args.uploads_playlist_id,
         output=args.output,
         max_videos=None if args.all else args.max_videos,
         lang_order=[lang.strip() for lang in args.languages.split(",") if lang.strip()],
