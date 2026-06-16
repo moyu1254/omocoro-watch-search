@@ -19,5 +19,7 @@
 
 - 動画情報とコメントは YouTube Data API から取得
 - 字幕本文のみ yt-dlp で取得
+- 取得済み字幕は既存indexから保持
+- 未取得字幕は定期更新で再試行
 - `YOUTUBE_API_KEY` が必要
 

@@ -39,6 +39,8 @@ PRESERVE_WHEN_EMPTY_FIELDS = [
     "transcriptSegments",
 ]
 CRITICAL_SEARCH_FIELDS = ["description", "tags", "transcriptSegments", "publishedAt"]
+DEFAULT_RETRY_RECENT_COUNT = 5
+DEFAULT_RETRY_RECENT_DAYS = 14
 
 
 def normalize_text(value: str) -> str:
@@ -86,6 +88,15 @@ def format_upload_date(value: str) -> str:
     if re.fullmatch(r"\d{8}", value):
         return f"{value[:4]}-{value[4:6]}-{value[6:]}"
     return value
+
+
+def parse_iso_date(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value[:10] + "T00:00:00+00:00")
+    except ValueError:
+        return None
 
 
 def normalize_list(values: Any) -> list[str]:
@@ -147,6 +158,31 @@ def merge_video_with_existing(
         merged[field] = existing.get(field)
         restored_fields.append(field)
     return merged, restored_fields
+
+
+def should_fetch_transcript(
+    existing: dict[str, Any] | None,
+    published_at: str,
+    position: int,
+    retry_missing_transcripts: bool,
+    retry_recent_count: int,
+    retry_recent_days: int,
+) -> tuple[bool, str]:
+    if has_search_value((existing or {}).get("transcriptSegments")):
+        return False, "existing transcript preserved"
+    if not existing:
+        return True, "new video"
+    if retry_missing_transcripts:
+        return True, "missing transcript retry"
+    if retry_recent_count > 0 and position <= retry_recent_count:
+        return True, "recent missing transcript"
+
+    published = parse_iso_date(published_at)
+    if published and retry_recent_days > 0:
+        age_days = (datetime.now(timezone.utc) - published).days
+        if age_days <= retry_recent_days:
+            return True, "fresh missing transcript"
+    return False, "missing transcript retry disabled"
 
 
 def normalize_search_fields(values: Any, default_label: str) -> list[dict[str, Any]]:
@@ -754,6 +790,18 @@ def validate_against_existing(payload: dict[str, Any], existing_payload: dict[st
 
     existing_overlap = [existing_by_id[video_id] for video_id in overlap_ids]
     current_overlap = [current_by_id[video_id] for video_id in overlap_ids]
+    lost_transcript_ids = [
+        video_id
+        for video_id in overlap_ids
+        if has_search_value(existing_by_id[video_id].get("transcriptSegments"))
+        and not has_search_value(current_by_id[video_id].get("transcriptSegments"))
+    ]
+    if lost_transcript_ids:
+        raise SystemExit(
+            "Generated index lost transcript segments for existing videos: "
+            f"{', '.join(lost_transcript_ids[:10])}. Aborting to avoid shipping a degraded search index."
+        )
+
     for field in CRITICAL_SEARCH_FIELDS:
         existing_count = non_empty_count(existing_overlap, field)
         current_count = non_empty_count(current_overlap, field)
@@ -780,6 +828,12 @@ def validate_payload(payload: dict[str, Any], existing_payload: dict[str, Any] |
     description_count = sum(1 for video in videos if normalize_text(video.get("description") or ""))
     tags_count = sum(1 for video in videos if video.get("tags"))
     transcript_count = sum(1 for video in videos if video.get("transcriptSegments"))
+    api_field_counts = {
+        "title": sum(1 for video in videos if normalize_text(video.get("title") or "")),
+        "url": sum(1 for video in videos if normalize_text(video.get("url") or "")),
+        "publishedAt": sum(1 for video in videos if normalize_text(video.get("publishedAt") or "")),
+        "thumbnail": sum(1 for video in videos if normalize_text(video.get("thumbnail") or "")),
+    }
 
     if description_count == 0:
         raise SystemExit("Generated index has no descriptions. Aborting to avoid shipping a degraded search index.")
@@ -787,6 +841,11 @@ def validate_payload(payload: dict[str, Any], existing_payload: dict[str, Any] |
         raise SystemExit("Generated index has no tags. Aborting to avoid shipping a degraded search index.")
     if transcript_count == 0:
         raise SystemExit("Generated index has no transcript segments. Aborting to avoid shipping a degraded search index.")
+    for field, count in api_field_counts.items():
+        if count == 0:
+            raise SystemExit(
+                f"Generated index has no {field} values. Aborting because YouTube Data API metadata is degraded."
+            )
 
     latest = videos[0]
     latest_title = normalize_text(latest.get("title") or "")
@@ -809,8 +868,10 @@ def build_index(
     comments_per_video: int,
     extra_search_json: Path | None,
     site_url: str,
+    retry_missing_transcripts: bool,
+    retry_recent_count: int,
+    retry_recent_days: int,
 ) -> dict[str, Any]:
-    yt_dlp = load_yt_dlp()
     youtube_lang = preferred_youtube_lang(lang_order)
     if not youtube_api_key:
         raise SystemExit("YOUTUBE_API_KEY is required. YouTube Data API is the primary data source.")
@@ -836,10 +897,21 @@ def build_index(
     extra_fields = load_extra_search_fields(extra_search_json)
     videos: list[dict[str, Any]] = []
     missing_api_metadata_count = 0
+    api_metadata_fetched_count = 0
     transcript_failed_count = 0
+    transcript_attempted_count = 0
+    transcript_fetched_count = 0
+    transcript_restored_count = 0
+    skipped_transcript_count = 0
+    preserved_transcript_count = 0
+    videos_without_transcripts = 0
+    new_videos_without_transcripts = 0
     comments_failed_count = 0
+    comments_fetched_count = 0
     restored_video_count = 0
     new_video_count = 0
+    existing_video_count = 0
+    transcript_failures: list[tuple[str, str, str]] = []
 
     options = {
         "extractor_args": {"youtube": {"lang": [youtube_lang]}},
@@ -851,75 +923,112 @@ def build_index(
         "writeautomaticsub": False,
     }
 
-    with yt_dlp.YoutubeDL(options) as ydl:
-        for index, video_id in enumerate(video_ids, start=1):
-            api_video = api_metadata.get(video_id)
-            if not api_video:
-                missing_api_metadata_count += 1
-                print(f"[{index}/{len(video_ids)}] {video_id} API metadata missing; skipping", file=sys.stderr)
-                continue
-            print(f"[{index}/{len(video_ids)}] {video_id} {api_video.get('title', '')}", file=sys.stderr)
+    for index, video_id in enumerate(video_ids, start=1):
+        api_video = api_metadata.get(video_id)
+        if not api_video:
+            missing_api_metadata_count += 1
+            print(f"[{index}/{len(video_ids)}] {video_id} API metadata missing; skipping", file=sys.stderr)
+            continue
+        api_metadata_fetched_count += 1
+        print(f"[{index}/{len(video_ids)}] {video_id} {api_video.get('title', '')}", file=sys.stderr)
 
+        existing_video = existing_videos.get(video_id)
+        if existing_video:
+            existing_video_count += 1
+        else:
+            new_video_count += 1
+
+        fetch_transcript_now, transcript_reason = should_fetch_transcript(
+            existing_video,
+            api_video.get("publishedAt") or "",
+            index,
+            retry_missing_transcripts,
+            retry_recent_count,
+            retry_recent_days,
+        )
+        if fetch_transcript_now:
+            transcript_attempted_count += 1
+            print(f"  transcript fetch: {transcript_reason}", file=sys.stderr)
             try:
-                transcript = fetch_transcript(ydl, video_id, lang_order)
+                yt_dlp = load_yt_dlp()
+                with yt_dlp.YoutubeDL(options) as ydl:
+                    transcript = fetch_transcript(ydl, video_id, lang_order)
             except Exception as exc:  # noqa: BLE001
-                print(f"  transcript failed: {exc}", file=sys.stderr)
+                reason = str(exc)
+                print(f"  transcript failed: {reason}", file=sys.stderr)
+                transcript_failures.append((video_id, api_video.get("title", ""), reason))
                 transcript_failed_count += 1
                 transcript = []
+            if transcript:
+                transcript_fetched_count += 1
+        else:
+            skipped_transcript_count += 1
+            if existing_video and has_search_value(existing_video.get("transcriptSegments")):
+                preserved_transcript_count += 1
+            print(f"  transcript skipped: {transcript_reason}", file=sys.stderr)
+            transcript = []
 
-            try:
-                comments = fetch_youtube_api_comments(video_id, youtube_api_key, comments_per_video)
-            except Exception as exc:  # noqa: BLE001
-                print(f"  comments failed: {exc}", file=sys.stderr)
-                comments_failed_count += 1
-                comments = []
+        comments_fetch_succeeded = False
+        try:
+            comments = fetch_youtube_api_comments(video_id, youtube_api_key, comments_per_video)
+            comments_fetch_succeeded = comments_per_video > 0
+        except Exception as exc:  # noqa: BLE001
+            print(f"  comments failed: {exc}", file=sys.stderr)
+            comments_failed_count += 1
+            comments = []
+        if comments_fetch_succeeded:
+            comments_fetched_count += 1
 
-            additional_search_fields = [
-                *(api_video.get("additionalSearchFields") or []),
-                *extra_fields.get(video_id, []),
+        additional_search_fields = [
+            *(api_video.get("additionalSearchFields") or []),
+            *extra_fields.get(video_id, []),
+        ]
+        chapters = api_video.get("chapters") or []
+        existing_chapters = existing_video.get("chapters") if existing_video else []
+        if (
+            isinstance(existing_chapters, list)
+            and len(existing_chapters) > len(chapters)
+            and has_search_value(existing_chapters)
+        ):
+            chapters = []
+
+        current_video = {
+            "videoId": video_id,
+            "title": api_video.get("title") or "",
+            "url": f"https://www.youtube.com/watch?v={video_id}",
+            "thumbnail": api_video.get("thumbnail") or f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+            "publishedAt": api_video.get("publishedAt") or "",
+            "description": api_video.get("description") or "",
+            "tags": api_video.get("tags") or [],
+            "categories": api_video.get("categories") or [],
+            "chapters": chapters,
+            "additionalSearchFields": additional_search_fields,
+            "comments": comments,
+            "transcriptSegments": transcript,
+        }
+        merged_video, restored_fields = merge_video_with_existing(current_video, existing_video)
+        if restored_fields:
+            restored_video_count += 1
+            if "transcriptSegments" in restored_fields:
+                transcript_restored_count += 1
+            print(f"  restored from existing index: {', '.join(restored_fields)}", file=sys.stderr)
+        if not has_search_value(merged_video.get("transcriptSegments")):
+            videos_without_transcripts += 1
+            if not existing_video:
+                new_videos_without_transcripts += 1
+        if not existing_video:
+            sparse_fields = [
+                field
+                for field in ("publishedAt", "description", "tags", "categories", "transcriptSegments")
+                if not has_search_value(merged_video.get(field))
             ]
-            existing_video = existing_videos.get(video_id)
-            chapters = api_video.get("chapters") or []
-            existing_chapters = existing_video.get("chapters") if existing_video else []
-            if (
-                isinstance(existing_chapters, list)
-                and len(existing_chapters) > len(chapters)
-                and has_search_value(existing_chapters)
-            ):
-                chapters = []
-
-            current_video = {
-                "videoId": video_id,
-                "title": api_video.get("title") or "",
-                "url": f"https://www.youtube.com/watch?v={video_id}",
-                "thumbnail": api_video.get("thumbnail") or f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
-                "publishedAt": api_video.get("publishedAt") or "",
-                "description": api_video.get("description") or "",
-                "tags": api_video.get("tags") or [],
-                "categories": api_video.get("categories") or [],
-                "chapters": chapters,
-                "additionalSearchFields": additional_search_fields,
-                "comments": comments,
-                "transcriptSegments": transcript,
-            }
-            merged_video, restored_fields = merge_video_with_existing(current_video, existing_video)
-            if restored_fields:
-                restored_video_count += 1
-                print(f"  restored from existing index: {', '.join(restored_fields)}", file=sys.stderr)
-            elif not existing_video:
-                new_video_count += 1
-                sparse_fields = [
-                    field
-                    for field in ("publishedAt", "description", "tags", "categories", "transcriptSegments")
-                    if not has_search_value(current_video.get(field))
-                ]
-                if sparse_fields:
-                    print(
-                        "  new video has limited search data: "
-                        f"{', '.join(sparse_fields)}",
-                        file=sys.stderr,
-                    )
-            videos.append(merged_video)
+            if sparse_fields:
+                print(
+                    "  new video has limited search data: "
+                    f"{', '.join(sparse_fields)}",
+                    file=sys.stderr,
+                )
+        videos.append(merged_video)
 
     payload = {
         "generatedAt": datetime.now(timezone.utc).isoformat(),
@@ -930,19 +1039,40 @@ def build_index(
         "source": {
             "tool": "youtube-data-api",
             "transcriptTool": "yt-dlp",
+            "updateMode": "incremental",
+            "transcriptMode": "missing-only",
             "maxVideos": max_videos,
             "subtitleLanguages": lang_order,
             "commentsPerVideo": comments_per_video,
+            "retryMissingTranscripts": retry_missing_transcripts,
+            "retryRecentCount": retry_recent_count,
+            "retryRecentDays": retry_recent_days,
             "extraSearchJson": str(extra_search_json) if extra_search_json else "",
         },
         "videos": videos,
     }
 
-    print(f"missingApiMetadataVideos={missing_api_metadata_count}", file=sys.stderr)
-    print(f"transcriptFailedVideos={transcript_failed_count}", file=sys.stderr)
-    print(f"commentsFailedVideos={comments_failed_count}", file=sys.stderr)
-    print(f"restoredFromExistingVideos={restored_video_count}", file=sys.stderr)
+    print(f"totalVideos={len(videos)}", file=sys.stderr)
     print(f"newVideos={new_video_count}", file=sys.stderr)
+    print(f"existingVideos={existing_video_count}", file=sys.stderr)
+    print(f"apiMetadataFetchedVideos={api_metadata_fetched_count}", file=sys.stderr)
+    print(f"missingApiMetadataVideos={missing_api_metadata_count}", file=sys.stderr)
+    print(f"commentsFetchedVideos={comments_fetched_count}", file=sys.stderr)
+    print(f"commentsFailedVideos={comments_failed_count}", file=sys.stderr)
+    print(f"transcriptFetchAttemptedVideos={transcript_attempted_count}", file=sys.stderr)
+    print(f"transcriptFetchedVideos={transcript_fetched_count}", file=sys.stderr)
+    print(f"transcriptFetchFailedVideos={transcript_failed_count}", file=sys.stderr)
+    print(f"transcriptRestoredFromExistingVideos={transcript_restored_count}", file=sys.stderr)
+    print(f"videosWithoutTranscripts={videos_without_transcripts}", file=sys.stderr)
+    print(f"newVideosWithoutTranscripts={new_videos_without_transcripts}", file=sys.stderr)
+    print(f"skippedTranscriptVideos={skipped_transcript_count}", file=sys.stderr)
+    print(f"preservedTranscriptVideos={preserved_transcript_count}", file=sys.stderr)
+    if transcript_failures:
+        print("transcriptFetchFailed:", file=sys.stderr)
+        for failed_video_id, failed_title, reason in transcript_failures:
+            print(f"- {failed_video_id} {failed_title}", file=sys.stderr)
+            print(f"  reason: {reason}", file=sys.stderr)
+    print(f"restoredFromExistingVideos={restored_video_count}", file=sys.stderr)
 
     validate_payload(payload, existing_payload)
     write_outputs(payload, output)
@@ -964,6 +1094,9 @@ def main() -> int:
     parser.add_argument("--languages", default="ja,ja-JP,en", help="Comma-separated subtitle language preference order.")
     parser.add_argument("--youtube-api-key", default=os.environ.get("YOUTUBE_API_KEY", ""), help="Required YouTube Data API key. Defaults to YOUTUBE_API_KEY.")
     parser.add_argument("--comments-per-video", type=int, default=0, help="Top-level YouTube comments to index per video. Use 0 to skip commentThreads.list.")
+    parser.add_argument("--retry-missing-transcripts", action="store_true", help="Retry yt-dlp transcript extraction for videos without cached transcript segments.")
+    parser.add_argument("--retry-recent-count", type=int, default=DEFAULT_RETRY_RECENT_COUNT, help="Retry transcript extraction for this many recent videos when transcripts are missing.")
+    parser.add_argument("--retry-recent-days", type=int, default=DEFAULT_RETRY_RECENT_DAYS, help="Retry transcript extraction for missing videos published within this many days.")
     parser.add_argument("--extra-search-json", type=Path, help="Optional JSON file with additional search fields keyed by video id.")
     parser.add_argument("--site-url", default=os.environ.get("SITE_URL", DEFAULT_SITE_URL), help="Public site URL used in sitemap and structured data.")
     args = parser.parse_args()
@@ -980,6 +1113,9 @@ def main() -> int:
         comments_per_video=max(0, args.comments_per_video),
         extra_search_json=args.extra_search_json,
         site_url=args.site_url,
+        retry_missing_transcripts=args.retry_missing_transcripts,
+        retry_recent_count=max(0, args.retry_recent_count),
+        retry_recent_days=max(0, args.retry_recent_days),
     )
     print(f"Wrote {len(payload['videos'])} videos to {args.output}")
     return 0
