@@ -8,6 +8,7 @@
   --accent-dark: #c42e1b;
   --paper: #fffdf8;
   --mark: #fff0a3;
+  --page-gutter: 1rem;
   font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 
@@ -18,6 +19,7 @@
 body {
   margin: 0;
   min-height: 100vh;
+  overflow-x: clip;
   background:
     radial-gradient(circle at top left, rgba(233, 68, 46, 0.12), transparent 28rem),
     var(--bg);
@@ -33,7 +35,7 @@ a {
   align-items: center;
   justify-content: space-between;
   gap: 1rem;
-  width: min(1080px, calc(100% - 2rem));
+  width: min(1080px, calc(100% - (var(--page-gutter) * 2)));
   margin: 0 auto;
   padding: 1.25rem 0;
 }
@@ -44,13 +46,14 @@ a {
 }
 
 main {
-  width: min(1080px, calc(100% - 2rem));
+  width: min(1080px, calc(100% - (var(--page-gutter) * 2)));
   margin: 0 auto;
 }
 
 .hero {
   display: grid;
   place-items: center;
+  width: 100%;
   min-height: 48vh;
   padding: 3rem 0 4rem;
   text-align: center;
@@ -133,6 +136,7 @@ h1 {
 }
 
 .results-section {
+  width: 100%;
   padding: 0 0 4rem;
 }
 
@@ -192,10 +196,16 @@ h1 {
   display: grid;
   grid-template-columns: 180px 1fr;
   gap: 1rem;
+  width: 100%;
+  min-width: 0;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--paper);
   padding: 1rem;
+}
+
+.result-card > div {
+  min-width: 0;
 }
 
 .thumb {
@@ -220,6 +230,7 @@ h1 {
 }
 
 .result-title a {
+  overflow-wrap: anywhere;
   text-decoration-thickness: 0.08em;
   text-underline-offset: 0.18em;
 }
@@ -240,6 +251,7 @@ h1 {
   border-left: 4px solid var(--accent);
   padding: 0.35rem 0 0.35rem 0.7rem;
   color: var(--ink);
+  overflow-wrap: anywhere;
   text-decoration: none;
 }
 
@@ -390,5 +402,67 @@ mark {
 
   .video-list-item h2 {
     font-size: 1rem;
+  }
+}
+
+@media (max-width: 640px) {
+  :root {
+    --page-gutter: 1rem;
+  }
+
+  body {
+    overflow-x: hidden;
+  }
+
+  .site-header,
+  main,
+  .hero,
+  .search-form,
+  .results-section,
+  .result-card {
+    max-width: 100%;
+  }
+
+  .hero {
+    justify-items: stretch;
+    min-height: auto;
+    padding: 2rem 0 2.5rem;
+  }
+
+  h1,
+  .source-links,
+  .status {
+    justify-self: center;
+    max-width: 100%;
+  }
+
+  .search-form {
+    width: 100%;
+    gap: 0.65rem;
+  }
+
+  .search-form input,
+  .search-form button {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .source-links {
+    overflow-wrap: anywhere;
+  }
+
+  .results-section {
+    padding-bottom: 3rem;
+  }
+
+  .result-card {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0.85rem;
+    padding: 0.85rem;
+  }
+
+  .field-hit,
+  .meta {
+    overflow-wrap: anywhere;
   }
 }
