@@ -611,8 +611,14 @@ def write_static_seo_files(payload: dict[str, Any], output: Path, site_url: str)
             {
                 "@type": "ListItem",
                 "position": index,
-                "name": video.get("title") or "",
-                "url": video.get("url") or "",
+                "item": {
+                    "@type": "VideoObject",
+                    "name": video.get("title") or "",
+                    "url": video.get("url") or "",
+                    "thumbnailUrl": video.get("thumbnail") or "",
+                    "uploadDate": video.get("publishedAt") or "",
+                    "description": (video.get("description") or "")[:180],
+                },
             }
         )
 
@@ -636,8 +642,8 @@ def write_static_seo_files(payload: dict[str, Any], output: Path, site_url: str)
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>回一覧 | オモウォのあの回</title>
-    <meta name="description" content="オモウォのあの回の回一覧。ニュース! オモコロウォッチのタイトル、公開日、概要欄を掲載しています。">
+    <title>収録回一覧 | オモウォのあの回</title>
+    <meta name="description" content="ニュース! オモコロウォッチの収録回一覧です。各動画のタイトル、公開日、概要欄を確認できます。">
     <meta name="robots" content="index, follow">
     <link rel="canonical" href="{escape_html(public_url(site_url, 'videos.html'))}">
     <link rel="stylesheet" href="./styles.css">
@@ -667,7 +673,7 @@ def write_static_seo_files(payload: dict[str, Any], output: Path, site_url: str)
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>このサイトについて | オモウォのあの回</title>
-    <meta name="description" content="オモウォのあの回は、ニュース! オモコロウォッチの動画をキーワードで探せる非公式サイトです。">
+    <meta name="description" content="オモウォのあの回は、ニュース! オモコロウォッチの動画をタイトル、概要欄、タグ、チャプター、字幕、コメントから検索できる非公式サイトです。">
     <meta name="robots" content="index, follow">
     <link rel="canonical" href="{escape_html(public_url(site_url, 'about.html'))}">
     <link rel="stylesheet" href="./styles.css">
@@ -679,7 +685,7 @@ def write_static_seo_files(payload: dict[str, Any], output: Path, site_url: str)
 
     <main class="about-page">
       <h1>このサイトについて</h1>
-      <p class="about-copy">オモウォのあの回は、「ニュース！オモコロウォッチ」の動画をキーワードで探せる非公式サイトです。タイトル、概要欄、字幕、コメントなどをもとに、見たい回を探せます。</p>
+      <p class="about-copy">オモウォのあの回は、「ニュース! オモコロウォッチ」の動画をタイトル、概要欄、タグ、チャプター、字幕、コメントから検索できる非公式サイトです。公式サイトではありませんが、見たい回や話題を探しやすくするために作っています。</p>
       <p class="source-links"><a href="./index.html">検索ページへ戻る</a></p>
     </main>
   </body>
@@ -804,7 +810,61 @@ def update_homepage_site_url(output: Path, site_url: str) -> None:
 
     root_url = public_url(site_url)
     search_url = public_url(site_url, "?q={search_term_string}")
+    homepage_json = script_json(
+        {
+            "@context": "https://schema.org",
+            "@type": "WebSite",
+            "name": "オモウォのあの回",
+            "description": "ニュース! オモコロウォッチの動画をタイトル、概要欄、タグ、チャプター、字幕、コメントから検索できる非公式サイトです。",
+            "alternateName": [
+                "オモコロウォッチのあの回",
+                "ニュース! オモコロウォッチ検索",
+                "オモコロウォッチ 検索",
+            ],
+            "url": root_url,
+            "inLanguage": "ja",
+            "isAccessibleForFree": True,
+            "about": {
+                "@type": "Thing",
+                "name": "ニュース! オモコロウォッチ",
+                "url": "https://www.youtube.com/@news_omocorowatch",
+            },
+            "potentialAction": {
+                "@type": "SearchAction",
+                "target": {
+                    "@type": "EntryPoint",
+                    "urlTemplate": search_url,
+                },
+                "query-input": "required name=search_term_string",
+            },
+        }
+    )
     html = index_path.read_text(encoding="utf-8")
+    html = re.sub(
+        r"(<title>).*?(</title>)",
+        r"\1オモウォのあの回 | ニュース! オモコロウォッチ検索\2",
+        html,
+        count=1,
+        flags=re.DOTALL,
+    )
+    html = re.sub(
+        r'(<meta name="description" content=")[^"]+(">)',
+        r"\1ニュース! オモコロウォッチの動画を、タイトル・概要欄・タグ・チャプター・字幕・コメントから検索できる非公式サイトです。\2",
+        html,
+        count=1,
+    )
+    html = re.sub(
+        r'(<meta property="og:title" content=")[^"]+(">)',
+        r"\1オモウォのあの回 | ニュース! オモコロウォッチ検索\2",
+        html,
+        count=1,
+    )
+    html = re.sub(
+        r'(<meta property="og:description" content=")[^"]+(">)',
+        r"\1ニュース! オモコロウォッチの動画を、タイトル・概要欄・タグ・チャプター・字幕・コメントから検索できます。\2",
+        html,
+        count=1,
+    )
     html = re.sub(
         r'(<link rel="canonical" href=")[^"]+(">)',
         lambda match: f'{match.group(1)}{escape_html(root_url)}{match.group(2)}',
@@ -816,6 +876,13 @@ def update_homepage_site_url(output: Path, site_url: str) -> None:
         lambda match: f'{match.group(1)}{escape_html(root_url)}{match.group(2)}',
         html,
         count=1,
+    )
+    html = re.sub(
+        r'(<script type="application/ld\+json">)\s*.*?(\s*</script>)',
+        lambda match: f"{match.group(1)}\n{homepage_json}\n    {match.group(2).lstrip()}",
+        html,
+        count=1,
+        flags=re.DOTALL,
     )
     html = re.sub(
         r'("url":\s*")[^"]+(")',
