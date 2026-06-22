@@ -667,32 +667,6 @@ def write_static_seo_files(payload: dict[str, Any], output: Path, site_url: str)
 """
     (site_root / "videos.html").write_text(videos_html, encoding="utf-8")
 
-    about_html = f"""<!doctype html>
-<html lang="ja">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>このサイトについて | オモウォのあの回</title>
-    <meta name="description" content="オモウォのあの回は、ニュース! オモコロウォッチの動画をタイトル、概要欄、タグ、チャプター、字幕、コメントから検索できる非公式サイトです。">
-    <meta name="robots" content="index, follow">
-    <link rel="canonical" href="{escape_html(public_url(site_url, 'about.html'))}">
-    <link rel="stylesheet" href="./styles.css">
-  </head>
-  <body>
-    <header class="site-header">
-      <a class="brand" href="./index.html">オモウォのあの回</a>
-    </header>
-
-    <main class="about-page">
-      <h1>このサイトについて</h1>
-      <p class="about-copy">オモウォのあの回は、「ニュース! オモコロウォッチ」の動画をタイトル、概要欄、タグ、チャプター、字幕、コメントから検索できる非公式サイトです。公式サイトではありませんが、見たい回や話題を探しやすくするために作っています。</p>
-      <p class="source-links"><a href="./index.html">検索ページへ戻る</a></p>
-    </main>
-  </body>
-</html>
-"""
-    (site_root / "about.html").write_text(about_html, encoding="utf-8")
-
     sitemap = f"""<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
   <url>
