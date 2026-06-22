@@ -41,6 +41,17 @@ PRESERVE_WHEN_EMPTY_FIELDS = [
 CRITICAL_SEARCH_FIELDS = ["description", "tags", "transcriptSegments", "publishedAt"]
 DEFAULT_RETRY_RECENT_COUNT = 5
 DEFAULT_RETRY_RECENT_DAYS = 14
+UPDATE_MODES = ("fresh", "recent", "full")
+BOT_BLOCK_PATTERNS = (
+    "confirm you are not a bot",
+    "confirm you're not a bot",
+    "sign in to confirm",
+    "ログインして bot ではないことを確認",
+    "bot ではないことを確認",
+    "年齢確認",
+    "age-restricted",
+    "age restricted",
+)
 
 
 def normalize_text(value: str) -> str:
@@ -97,6 +108,13 @@ def parse_iso_date(value: str) -> datetime | None:
         return datetime.fromisoformat(value[:10] + "T00:00:00+00:00")
     except ValueError:
         return None
+
+
+def days_since(value: str) -> int | None:
+    parsed = parse_iso_date(value)
+    if not parsed:
+        return None
+    return (datetime.now(timezone.utc) - parsed).days
 
 
 def normalize_list(values: Any) -> list[str]:
@@ -160,6 +178,11 @@ def merge_video_with_existing(
     return merged, restored_fields
 
 
+def is_blocked_transcript_error(reason: str) -> bool:
+    lowered = str(reason or "").casefold()
+    return any(pattern.casefold() in lowered for pattern in BOT_BLOCK_PATTERNS)
+
+
 def should_fetch_transcript(
     existing: dict[str, Any] | None,
     published_at: str,
@@ -167,22 +190,49 @@ def should_fetch_transcript(
     retry_missing_transcripts: bool,
     retry_recent_count: int,
     retry_recent_days: int,
+    update_mode: str,
 ) -> tuple[bool, str]:
     if has_search_value((existing or {}).get("transcriptSegments")):
         return False, "existing transcript preserved"
     if not existing:
         return True, "new video"
-    if retry_missing_transcripts:
-        return True, "missing transcript retry"
-    if retry_recent_count > 0 and position <= retry_recent_count:
+    age_days = days_since(published_at)
+    if update_mode == "full":
+        if retry_missing_transcripts:
+            return True, "missing transcript retry"
+        return False, "full mode missing transcript retry disabled"
+    if update_mode in ("fresh", "recent") and retry_recent_count > 0 and position <= retry_recent_count:
         return True, "recent missing transcript"
-
-    published = parse_iso_date(published_at)
-    if published and retry_recent_days > 0:
-        age_days = (datetime.now(timezone.utc) - published).days
-        if age_days <= retry_recent_days:
-            return True, "fresh missing transcript"
+    if update_mode in ("fresh", "recent") and age_days is not None and age_days <= 30:
+        return True, "missing transcript within 30 days"
+    if age_days is not None and retry_recent_days > 0 and age_days <= retry_recent_days:
+        return True, "fresh missing transcript"
     return False, "missing transcript retry disabled"
+
+
+def should_fetch_comments(
+    existing: dict[str, Any] | None,
+    published_at: str,
+    position: int,
+    update_mode: str,
+    comments_per_video: int,
+) -> tuple[bool, str]:
+    if comments_per_video <= 0:
+        return False, "comments disabled"
+    if not existing:
+        return True, "new video"
+    age_days = days_since(published_at)
+    if update_mode == "fresh":
+        if position <= 5:
+            return True, "fresh recent video"
+        if age_days is not None and age_days <= 3:
+            return True, "fresh within 3 days"
+    if update_mode == "recent":
+        if position <= 5:
+            return True, "recent video"
+        if age_days is not None and age_days <= 14:
+            return True, "recent within 14 days"
+    return False, "existing comments preserved"
 
 
 def normalize_search_fields(values: Any, default_label: str) -> list[dict[str, Any]]:
@@ -971,6 +1021,7 @@ def build_index(
     retry_missing_transcripts: bool,
     retry_recent_count: int,
     retry_recent_days: int,
+    update_mode: str,
 ) -> dict[str, Any]:
     youtube_lang = preferred_youtube_lang(lang_order)
     if not youtube_api_key:
@@ -1004,13 +1055,18 @@ def build_index(
     transcript_restored_count = 0
     skipped_transcript_count = 0
     preserved_transcript_count = 0
+    transcript_blocked_count = 0
     videos_without_transcripts = 0
     new_videos_without_transcripts = 0
     comments_failed_count = 0
     comments_fetched_count = 0
+    comments_restored_count = 0
+    comments_skipped_count = 0
     restored_video_count = 0
     new_video_count = 0
     existing_video_count = 0
+    recent_video_count = 0
+    fresh_video_count = 0
     transcript_failures: list[tuple[str, str, str]] = []
 
     options = {
@@ -1037,6 +1093,11 @@ def build_index(
             existing_video_count += 1
         else:
             new_video_count += 1
+        age_days = days_since(api_video.get("publishedAt") or "")
+        if index <= 5 or (age_days is not None and age_days <= 14):
+            recent_video_count += 1
+        if not existing_video or index <= 5 or (age_days is not None and age_days <= 3):
+            fresh_video_count += 1
 
         fetch_transcript_now, transcript_reason = should_fetch_transcript(
             existing_video,
@@ -1045,6 +1106,7 @@ def build_index(
             retry_missing_transcripts,
             retry_recent_count,
             retry_recent_days,
+            update_mode,
         )
         if fetch_transcript_now:
             transcript_attempted_count += 1
@@ -1058,6 +1120,8 @@ def build_index(
                 print(f"  transcript failed: {reason}", file=sys.stderr)
                 transcript_failures.append((video_id, api_video.get("title", ""), reason))
                 transcript_failed_count += 1
+                if is_blocked_transcript_error(reason):
+                    transcript_blocked_count += 1
                 transcript = []
             if transcript:
                 transcript_fetched_count += 1
@@ -1068,13 +1132,26 @@ def build_index(
             print(f"  transcript skipped: {transcript_reason}", file=sys.stderr)
             transcript = []
 
+        fetch_comments_now, comments_reason = should_fetch_comments(
+            existing_video,
+            api_video.get("publishedAt") or "",
+            index,
+            update_mode,
+            comments_per_video,
+        )
         comments_fetch_succeeded = False
-        try:
-            comments = fetch_youtube_api_comments(video_id, youtube_api_key, comments_per_video)
-            comments_fetch_succeeded = comments_per_video > 0
-        except Exception as exc:  # noqa: BLE001
-            print(f"  comments failed: {exc}", file=sys.stderr)
-            comments_failed_count += 1
+        if fetch_comments_now:
+            print(f"  comments fetch: {comments_reason}", file=sys.stderr)
+            try:
+                comments = fetch_youtube_api_comments(video_id, youtube_api_key, comments_per_video)
+                comments_fetch_succeeded = True
+            except Exception as exc:  # noqa: BLE001
+                print(f"  comments failed: {exc}", file=sys.stderr)
+                comments_failed_count += 1
+                comments = []
+        else:
+            comments_skipped_count += 1
+            print(f"  comments skipped: {comments_reason}", file=sys.stderr)
             comments = []
         if comments_fetch_succeeded:
             comments_fetched_count += 1
@@ -1111,6 +1188,8 @@ def build_index(
             restored_video_count += 1
             if "transcriptSegments" in restored_fields:
                 transcript_restored_count += 1
+            if "comments" in restored_fields:
+                comments_restored_count += 1
             print(f"  restored from existing index: {', '.join(restored_fields)}", file=sys.stderr)
         if not has_search_value(merged_video.get("transcriptSegments")):
             videos_without_transcripts += 1
@@ -1140,7 +1219,7 @@ def build_index(
         "source": {
             "tool": "youtube-data-api",
             "transcriptTool": "yt-dlp",
-            "updateMode": "incremental",
+            "updateMode": update_mode,
             "transcriptMode": "missing-only",
             "maxVideos": max_videos,
             "subtitleLanguages": lang_order,
@@ -1154,16 +1233,23 @@ def build_index(
     }
 
     print(f"totalVideos={len(videos)}", file=sys.stderr)
+    print(f"updateMode={update_mode}", file=sys.stderr)
     print(f"newVideos={new_video_count}", file=sys.stderr)
     print(f"existingVideos={existing_video_count}", file=sys.stderr)
+    print(f"recentVideos={recent_video_count}", file=sys.stderr)
+    print(f"freshVideos={fresh_video_count}", file=sys.stderr)
     print(f"apiMetadataFetchedVideos={api_metadata_fetched_count}", file=sys.stderr)
     print(f"missingApiMetadataVideos={missing_api_metadata_count}", file=sys.stderr)
     print(f"commentsFetchedVideos={comments_fetched_count}", file=sys.stderr)
+    print(f"commentsRestoredFromExistingVideos={comments_restored_count}", file=sys.stderr)
+    print(f"commentsSkippedVideos={comments_skipped_count}", file=sys.stderr)
     print(f"commentsFailedVideos={comments_failed_count}", file=sys.stderr)
     print(f"transcriptFetchAttemptedVideos={transcript_attempted_count}", file=sys.stderr)
     print(f"transcriptFetchedVideos={transcript_fetched_count}", file=sys.stderr)
     print(f"transcriptFetchFailedVideos={transcript_failed_count}", file=sys.stderr)
     print(f"transcriptRestoredFromExistingVideos={transcript_restored_count}", file=sys.stderr)
+    print(f"transcriptSkippedVideos={skipped_transcript_count}", file=sys.stderr)
+    print(f"transcriptBlockedVideos={transcript_blocked_count}", file=sys.stderr)
     print(f"videosWithoutTranscripts={videos_without_transcripts}", file=sys.stderr)
     print(f"newVideosWithoutTranscripts={new_videos_without_transcripts}", file=sys.stderr)
     print(f"skippedTranscriptVideos={skipped_transcript_count}", file=sys.stderr)
@@ -1193,6 +1279,7 @@ def main() -> int:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--max-videos", type=int, default=30)
     parser.add_argument("--all", action="store_true", help="Fetch every video currently listed on the channel.")
+    parser.add_argument("--update-mode", choices=UPDATE_MODES, default="recent", help="Update targeting mode: fresh for Sunday/Monday, recent for weekday catch-up, full for broad consistency checks.")
     parser.add_argument("--languages", default="ja,ja-JP,en", help="Comma-separated subtitle language preference order.")
     parser.add_argument("--youtube-api-key", default=os.environ.get("YOUTUBE_API_KEY", ""), help="Required YouTube Data API key. Defaults to YOUTUBE_API_KEY.")
     parser.add_argument("--comments-per-video", type=int, default=0, help="Top-level YouTube comments to index per video. Use 0 to skip commentThreads.list.")
@@ -1218,6 +1305,7 @@ def main() -> int:
         retry_missing_transcripts=args.retry_missing_transcripts,
         retry_recent_count=max(0, args.retry_recent_count),
         retry_recent_days=max(0, args.retry_recent_days),
+        update_mode=args.update_mode,
     )
     print(f"Wrote {len(payload['videos'])} videos to {args.output}")
     return 0

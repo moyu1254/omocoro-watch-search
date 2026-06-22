@@ -2,9 +2,27 @@ name: Update search index
 
 on:
   workflow_dispatch:
+    inputs:
+      update_mode:
+        description: "Update mode"
+        type: choice
+        required: true
+        default: fresh
+        options:
+          - fresh
+          - recent
+          - full
   schedule:
-    # Monday, Wednesday, and Saturday 00:30 JST.
-    - cron: "30 15 * * 0,2,5"
+    # Sunday 00:20 JST.
+    - cron: "20 15 * * 6"
+    # Sunday 03:00 JST.
+    - cron: "0 18 * * 6"
+    # Sunday 12:00 JST.
+    - cron: "0 3 * * 0"
+    # Monday 00:30 JST.
+    - cron: "30 15 * * 0"
+    # Tuesday-Saturday 00:30 JST.
+    - cron: "30 15 * * 1-5"
 
 permissions:
   contents: write
@@ -28,7 +46,17 @@ jobs:
         env:
           YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
           SITE_URL: https://omowatch.com/
-        run: python work/scripts/build_index.py --all --comments-per-video 20 --retry-missing-transcripts --retry-recent-count 5
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            UPDATE_MODE="${{ inputs.update_mode }}"
+          elif [ "${{ github.event.schedule }}" = "30 15 * * 1-5" ]; then
+            UPDATE_MODE="recent"
+          else
+            UPDATE_MODE="fresh"
+          fi
+          echo "updateMode=${UPDATE_MODE}"
+          python work/scripts/build_index.py --all --update-mode "${UPDATE_MODE}" --comments-per-video 20 --retry-missing-transcripts --retry-recent-count 5
 
       - name: Validate index
         run: |
