@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import html as html_lib
 import json
 import os
 import re
@@ -15,6 +16,7 @@ from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import urlencode, unquote, urlparse
 from urllib.request import urlopen
+from xml.etree import ElementTree
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -42,6 +44,7 @@ CRITICAL_SEARCH_FIELDS = ["description", "tags", "transcriptSegments", "publishe
 DEFAULT_RETRY_RECENT_COUNT = 5
 DEFAULT_RETRY_RECENT_DAYS = 14
 UPDATE_MODES = ("fresh", "recent", "full")
+SUBTITLE_FORMAT_PREFERENCE = ("json3", "srv3", "srv2", "vtt")
 BOT_BLOCK_PATTERNS = (
     "confirm you are not a bot",
     "confirm you're not a bot",
@@ -52,6 +55,10 @@ BOT_BLOCK_PATTERNS = (
     "age-restricted",
     "age restricted",
 )
+
+
+class TranscriptUnavailableError(RuntimeError):
+    """Raised when caption tracks exist but none use a supported format."""
 
 
 def normalize_text(value: str) -> str:
@@ -87,6 +94,112 @@ def parse_subtitle_json3(payload: dict[str, Any]) -> list[dict[str, Any]]:
         duration = (event.get("dDurationMs") or 0) / 1000
         segments.append({"start": round(start, 3), "duration": round(duration, 3), "text": text})
     return segments
+
+
+def parse_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def local_xml_name(tag: str) -> str:
+    return str(tag).rsplit("}", 1)[-1]
+
+
+def parse_subtitle_xml(text: str) -> list[dict[str, Any]]:
+    root = ElementTree.fromstring(text)
+    segments: list[dict[str, Any]] = []
+    for node in root.iter():
+        name = local_xml_name(node.tag)
+        if name not in ("text", "p"):
+            continue
+        raw_text = html_lib.unescape("".join(node.itertext()))
+        caption_text = normalize_text(raw_text)
+        if not caption_text:
+            continue
+        attrs = node.attrib
+        if "start" in attrs:
+            start = parse_float(attrs.get("start"))
+        else:
+            start = parse_float(attrs.get("t")) / 1000
+        if "dur" in attrs:
+            duration = parse_float(attrs.get("dur"))
+        else:
+            duration = parse_float(attrs.get("d")) / 1000
+        segments.append(
+            {"start": round(start, 3), "duration": round(duration, 3), "text": caption_text}
+        )
+    return segments
+
+
+def parse_vtt_timestamp(value: str) -> float:
+    match = re.fullmatch(r"(?:(\d+):)?(\d{2}):(\d{2})[\.,](\d{3})", value.strip())
+    if not match:
+        raise ValueError(f"Invalid VTT timestamp: {value}")
+    hours = int(match.group(1) or 0)
+    minutes = int(match.group(2))
+    seconds = int(match.group(3))
+    milliseconds = int(match.group(4))
+    return hours * 3600 + minutes * 60 + seconds + milliseconds / 1000
+
+
+def clean_vtt_text(lines: list[str]) -> str:
+    text = "\n".join(lines)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = html_lib.unescape(text)
+    return normalize_text(text)
+
+
+def parse_subtitle_vtt(text: str) -> list[dict[str, Any]]:
+    segments: list[dict[str, Any]] = []
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    index = 0
+    while index < len(lines):
+        line = lines[index].strip("\ufeff")
+        if not line.strip() or line.startswith(("WEBVTT", "Kind:", "Language:")):
+            index += 1
+            continue
+        if line.startswith(("NOTE", "STYLE", "REGION")):
+            index += 1
+            while index < len(lines) and lines[index].strip():
+                index += 1
+            continue
+        if "-->" not in line:
+            index += 1
+            if index >= len(lines):
+                break
+            line = lines[index].strip()
+        if "-->" not in line:
+            continue
+        start_raw, end_raw = line.split("-->", 1)
+        start = parse_vtt_timestamp(start_raw.strip())
+        end = parse_vtt_timestamp(end_raw.strip().split()[0])
+        index += 1
+        cue_lines: list[str] = []
+        while index < len(lines) and lines[index].strip():
+            cue_lines.append(lines[index])
+            index += 1
+        cue_text = clean_vtt_text(cue_lines)
+        if cue_text:
+            segments.append(
+                {
+                    "start": round(start, 3),
+                    "duration": round(max(0, end - start), 3),
+                    "text": cue_text,
+                }
+            )
+    return segments
+
+
+def parse_subtitle_payload(ext: str, text: str) -> list[dict[str, Any]]:
+    if ext == "json3":
+        return parse_subtitle_json3(json.loads(text))
+    if ext in ("srv3", "srv2"):
+        return parse_subtitle_xml(text)
+    if ext == "vtt":
+        return parse_subtitle_vtt(text)
+    raise ValueError(f"Unsupported subtitle format: {ext}")
 
 
 def format_upload_date(value: str) -> str:
@@ -761,6 +874,16 @@ def write_outputs(payload: dict[str, Any], output: Path) -> None:
     )
 
 
+def caption_language_keys(captions: dict[str, Any]) -> list[str]:
+    return sorted(str(key) for key in captions.keys())
+
+
+def caption_candidate_exts(candidates: Any) -> list[str]:
+    if not isinstance(candidates, list):
+        return []
+    return [str(item.get("ext") or "") for item in candidates if isinstance(item, dict)]
+
+
 def iter_caption_tracks(captions: dict[str, Any], lang_order: list[str]):
     seen: set[str] = set()
 
@@ -770,20 +893,53 @@ def iter_caption_tracks(captions: dict[str, Any], lang_order: list[str]):
                 continue
             if key == lang or key.startswith(f"{lang}-"):
                 seen.add(key)
-                yield candidates
+                yield key, candidates
 
     for key, candidates in captions.items():
         if key in seen:
             continue
         if key == "ja" or key.startswith("ja-"):
             seen.add(key)
-            yield candidates
+            yield key, candidates
 
     for key, candidates in captions.items():
         if key in seen:
             continue
         seen.add(key)
-        yield candidates
+        yield key, candidates
+
+
+def log_caption_diagnostics(video_id: str, subtitles: dict[str, Any], automatic: dict[str, Any]) -> None:
+    print(f"  transcript diagnostics: videoId={video_id}", file=sys.stderr)
+    print(
+        f"  transcript diagnostics: subtitles languages={caption_language_keys(subtitles)}",
+        file=sys.stderr,
+    )
+    print(
+        f"  transcript diagnostics: automatic_captions languages={caption_language_keys(automatic)}",
+        file=sys.stderr,
+    )
+
+
+def select_caption_track(
+    subtitles: dict[str, Any],
+    automatic: dict[str, Any],
+    lang_order: list[str],
+) -> tuple[str, str, dict[str, Any]] | None:
+    for source_name, captions in (("subtitles", subtitles), ("automatic_captions", automatic)):
+        for lang_key, candidates in iter_caption_tracks(captions, lang_order):
+            if not isinstance(candidates, list):
+                continue
+            print(
+                f"  transcript diagnostics: candidate {source_name}[{lang_key}] ext="
+                f"{caption_candidate_exts(candidates)}",
+                file=sys.stderr,
+            )
+            for ext in SUBTITLE_FORMAT_PREFERENCE:
+                for item in candidates:
+                    if isinstance(item, dict) and item.get("ext") == ext:
+                        return lang_key, ext, item
+    return None
 
 
 def fetch_transcript(ydl: Any, video_id: str, lang_order: list[str]) -> list[dict[str, Any]]:
@@ -792,16 +948,29 @@ def fetch_transcript(ydl: Any, video_id: str, lang_order: list[str]) -> list[dic
         return []
     subtitles = info.get("subtitles") or {}
     automatic = info.get("automatic_captions") or {}
+    log_caption_diagnostics(video_id, subtitles, automatic)
 
-    for captions in (subtitles, automatic):
-        for candidates in iter_caption_tracks(captions, lang_order):
-            json3 = next((item for item in candidates if item.get("ext") == "json3"), None)
-            if not json3:
-                continue
-            data = ydl.urlopen(json3["url"]).read().decode("utf-8", errors="replace")
-            return parse_subtitle_json3(json.loads(data))
+    if not subtitles and not automatic:
+        print(f"  transcript no captions: {video_id}", file=sys.stderr)
+        return []
 
-    return []
+    selected = select_caption_track(subtitles, automatic, lang_order)
+    if not selected:
+        raise TranscriptUnavailableError(
+            f"caption tracks found but no supported formats: {', '.join(SUBTITLE_FORMAT_PREFERENCE)}"
+        )
+
+    lang_key, ext, track = selected
+    print(f"  transcript selected language: {lang_key}", file=sys.stderr)
+    print(f"  transcript selected format: {ext}", file=sys.stderr)
+    url = track.get("url")
+    if not url:
+        raise RuntimeError(f"selected caption track has no URL: {lang_key} {ext}")
+    data = ydl.urlopen(url).read().decode("utf-8", errors="replace")
+    segments = parse_subtitle_payload(ext, data)
+    if not segments:
+        raise RuntimeError(f"{ext} caption parsed no transcript segments")
+    return segments
 
 
 def update_homepage_latest_link(payload: dict[str, Any], output: Path) -> None:
@@ -1056,6 +1225,7 @@ def build_index(
     skipped_transcript_count = 0
     preserved_transcript_count = 0
     transcript_blocked_count = 0
+    transcript_unavailable_count = 0
     videos_without_transcripts = 0
     new_videos_without_transcripts = 0
     comments_failed_count = 0
@@ -1115,6 +1285,11 @@ def build_index(
                 yt_dlp = load_yt_dlp()
                 with yt_dlp.YoutubeDL(options) as ydl:
                     transcript = fetch_transcript(ydl, video_id, lang_order)
+            except TranscriptUnavailableError as exc:
+                reason = str(exc)
+                print(f"  transcript unavailable: {reason}", file=sys.stderr)
+                transcript_unavailable_count += 1
+                transcript = []
             except Exception as exc:  # noqa: BLE001
                 reason = str(exc)
                 print(f"  transcript failed: {reason}", file=sys.stderr)
@@ -1250,6 +1425,7 @@ def build_index(
     print(f"transcriptRestoredFromExistingVideos={transcript_restored_count}", file=sys.stderr)
     print(f"transcriptSkippedVideos={skipped_transcript_count}", file=sys.stderr)
     print(f"transcriptBlockedVideos={transcript_blocked_count}", file=sys.stderr)
+    print(f"transcriptUnavailableVideos={transcript_unavailable_count}", file=sys.stderr)
     print(f"videosWithoutTranscripts={videos_without_transcripts}", file=sys.stderr)
     print(f"newVideosWithoutTranscripts={new_videos_without_transcripts}", file=sys.stderr)
     print(f"skippedTranscriptVideos={skipped_transcript_count}", file=sys.stderr)
