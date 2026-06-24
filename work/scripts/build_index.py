@@ -945,7 +945,7 @@ def select_caption_track(
 def fetch_transcript(ydl: Any, video_id: str, lang_order: list[str]) -> list[dict[str, Any]]:
     info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
     if not info:
-        return []
+        raise RuntimeError("yt-dlp returned no video info")
     subtitles = info.get("subtitles") or {}
     automatic = info.get("automatic_captions") or {}
     log_caption_diagnostics(video_id, subtitles, automatic)
@@ -1241,7 +1241,7 @@ def build_index(
 
     options = {
         "extractor_args": {"youtube": {"lang": [youtube_lang]}},
-        "ignoreerrors": True,
+        "ignoreerrors": False,
         "no_warnings": True,
         "quiet": True,
         "skip_download": True,
