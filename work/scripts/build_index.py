@@ -23,6 +23,7 @@ ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CHANNEL_URL = "https://www.youtube.com/@news_omocorowatch"
 DEFAULT_CHANNEL_HANDLE = "@news_omocorowatch"
 DEFAULT_OUTPUT = ROOT / "outputs" / "omocoro-watch-search" / "data" / "search-index.json"
+DEFAULT_MANUAL_TRANSCRIPTS_DIR = Path("manual_transcripts")
 DEFAULT_SITE_URL = "https://omowatch.com/"
 YOUTUBE_API_BASE = "https://www.googleapis.com/youtube/v3"
 YOUTUBE_UI_LANG_FALLBACKS = {
@@ -250,6 +251,69 @@ def has_search_value(value: Any) -> bool:
     if isinstance(value, list):
         return bool(value)
     return value not in (None, "", [])
+
+
+def normalize_transcript_segments(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        raise ValueError("transcriptSegments must be an array")
+    segments: list[dict[str, Any]] = []
+    for index, segment in enumerate(value, start=1):
+        if not isinstance(segment, dict):
+            raise ValueError(f"segment {index} must be an object")
+        text = normalize_text(str(segment.get("text") or ""))
+        if not text:
+            continue
+        try:
+            start = float(segment.get("start"))
+            duration = float(segment.get("duration"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"segment {index} has invalid start or duration") from exc
+        if start < 0 or duration < 0:
+            raise ValueError(f"segment {index} has negative start or duration")
+        segments.append({"start": round(start, 3), "duration": round(duration, 3), "text": text})
+    return segments
+
+
+def extract_transcript_segments_payload(data: Any, expected_video_id: str) -> list[dict[str, Any]]:
+    if isinstance(data, list):
+        return normalize_transcript_segments(data)
+    if isinstance(data, dict):
+        video_id = str(data.get("videoId") or "")
+        if video_id and video_id != expected_video_id:
+            raise ValueError(f"videoId mismatch: expected {expected_video_id}, got {video_id}")
+        return normalize_transcript_segments(data.get("transcriptSegments"))
+    raise ValueError("manual transcript JSON must be an array or object")
+
+
+def load_manual_transcripts(manual_transcripts_dir: Path | None) -> tuple[dict[str, list[dict[str, Any]]], int]:
+    if manual_transcripts_dir is None:
+        return {}, 0
+    if not manual_transcripts_dir.exists():
+        return {}, 0
+    if not manual_transcripts_dir.is_dir():
+        print(
+            f"manual transcripts path is not a directory; skipping: {manual_transcripts_dir}",
+            file=sys.stderr,
+        )
+        return {}, 1
+
+    transcripts: dict[str, list[dict[str, Any]]] = {}
+    invalid_count = 0
+    for path in sorted(manual_transcripts_dir.glob("*.json")):
+        video_id = path.stem
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            segments = extract_transcript_segments_payload(data, video_id)
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            print(f"manual transcript invalid: {path} ({exc})", file=sys.stderr)
+            invalid_count += 1
+            continue
+        if not segments:
+            print(f"manual transcript invalid: {path} (no non-empty segments)", file=sys.stderr)
+            invalid_count += 1
+            continue
+        transcripts[video_id] = segments
+    return transcripts, invalid_count
 
 
 def load_existing_payload(output: Path) -> dict[str, Any]:
@@ -1191,6 +1255,7 @@ def build_index(
     retry_recent_count: int,
     retry_recent_days: int,
     update_mode: str,
+    manual_transcripts_dir: Path | None,
 ) -> dict[str, Any]:
     youtube_lang = preferred_youtube_lang(lang_order)
     if not youtube_api_key:
@@ -1215,6 +1280,7 @@ def build_index(
 
     api_metadata = fetch_youtube_api_metadata(video_ids, youtube_api_key)
     extra_fields = load_extra_search_fields(extra_search_json)
+    manual_transcripts, manual_transcript_invalid_count = load_manual_transcripts(manual_transcripts_dir)
     videos: list[dict[str, Any]] = []
     missing_api_metadata_count = 0
     api_metadata_fetched_count = 0
@@ -1226,6 +1292,7 @@ def build_index(
     preserved_transcript_count = 0
     transcript_blocked_count = 0
     transcript_unavailable_count = 0
+    manual_transcript_used_count = 0
     videos_without_transcripts = 0
     new_videos_without_transcripts = 0
     comments_failed_count = 0
@@ -1269,43 +1336,49 @@ def build_index(
         if not existing_video or index <= 5 or (age_days is not None and age_days <= 3):
             fresh_video_count += 1
 
-        fetch_transcript_now, transcript_reason = should_fetch_transcript(
-            existing_video,
-            api_video.get("publishedAt") or "",
-            index,
-            retry_missing_transcripts,
-            retry_recent_count,
-            retry_recent_days,
-            update_mode,
-        )
-        if fetch_transcript_now:
-            transcript_attempted_count += 1
-            print(f"  transcript fetch: {transcript_reason}", file=sys.stderr)
-            try:
-                yt_dlp = load_yt_dlp()
-                with yt_dlp.YoutubeDL(options) as ydl:
-                    transcript = fetch_transcript(ydl, video_id, lang_order)
-            except TranscriptUnavailableError as exc:
-                reason = str(exc)
-                print(f"  transcript unavailable: {reason}", file=sys.stderr)
-                transcript_unavailable_count += 1
-                transcript = []
-            except Exception as exc:  # noqa: BLE001
-                reason = str(exc)
-                print(f"  transcript failed: {reason}", file=sys.stderr)
-                transcript_failures.append((video_id, api_video.get("title", ""), reason))
-                transcript_failed_count += 1
-                if is_blocked_transcript_error(reason):
-                    transcript_blocked_count += 1
-                transcript = []
-            if transcript:
-                transcript_fetched_count += 1
+        manual_transcript = manual_transcripts.get(video_id)
+        if not has_search_value((existing_video or {}).get("transcriptSegments")) and manual_transcript:
+            transcript = manual_transcript
+            manual_transcript_used_count += 1
+            print(f"  transcript manual fallback: {video_id}", file=sys.stderr)
         else:
-            skipped_transcript_count += 1
-            if existing_video and has_search_value(existing_video.get("transcriptSegments")):
-                preserved_transcript_count += 1
-            print(f"  transcript skipped: {transcript_reason}", file=sys.stderr)
-            transcript = []
+            fetch_transcript_now, transcript_reason = should_fetch_transcript(
+                existing_video,
+                api_video.get("publishedAt") or "",
+                index,
+                retry_missing_transcripts,
+                retry_recent_count,
+                retry_recent_days,
+                update_mode,
+            )
+            if fetch_transcript_now:
+                transcript_attempted_count += 1
+                print(f"  transcript fetch: {transcript_reason}", file=sys.stderr)
+                try:
+                    yt_dlp = load_yt_dlp()
+                    with yt_dlp.YoutubeDL(options) as ydl:
+                        transcript = fetch_transcript(ydl, video_id, lang_order)
+                except TranscriptUnavailableError as exc:
+                    reason = str(exc)
+                    print(f"  transcript unavailable: {reason}", file=sys.stderr)
+                    transcript_unavailable_count += 1
+                    transcript = []
+                except Exception as exc:  # noqa: BLE001
+                    reason = str(exc)
+                    print(f"  transcript failed: {reason}", file=sys.stderr)
+                    transcript_failures.append((video_id, api_video.get("title", ""), reason))
+                    transcript_failed_count += 1
+                    if is_blocked_transcript_error(reason):
+                        transcript_blocked_count += 1
+                    transcript = []
+                if transcript:
+                    transcript_fetched_count += 1
+            else:
+                skipped_transcript_count += 1
+                if existing_video and has_search_value(existing_video.get("transcriptSegments")):
+                    preserved_transcript_count += 1
+                print(f"  transcript skipped: {transcript_reason}", file=sys.stderr)
+                transcript = []
 
         fetch_comments_now, comments_reason = should_fetch_comments(
             existing_video,
@@ -1402,6 +1475,7 @@ def build_index(
             "retryMissingTranscripts": retry_missing_transcripts,
             "retryRecentCount": retry_recent_count,
             "retryRecentDays": retry_recent_days,
+            "manualTranscriptsDir": str(manual_transcripts_dir) if manual_transcripts_dir else "",
             "extraSearchJson": str(extra_search_json) if extra_search_json else "",
         },
         "videos": videos,
@@ -1426,6 +1500,8 @@ def build_index(
     print(f"transcriptSkippedVideos={skipped_transcript_count}", file=sys.stderr)
     print(f"transcriptBlockedVideos={transcript_blocked_count}", file=sys.stderr)
     print(f"transcriptUnavailableVideos={transcript_unavailable_count}", file=sys.stderr)
+    print(f"manualTranscriptUsedVideos={manual_transcript_used_count}", file=sys.stderr)
+    print(f"manualTranscriptInvalidVideos={manual_transcript_invalid_count}", file=sys.stderr)
     print(f"videosWithoutTranscripts={videos_without_transcripts}", file=sys.stderr)
     print(f"newVideosWithoutTranscripts={new_videos_without_transcripts}", file=sys.stderr)
     print(f"skippedTranscriptVideos={skipped_transcript_count}", file=sys.stderr)
@@ -1462,6 +1538,7 @@ def main() -> int:
     parser.add_argument("--retry-missing-transcripts", action="store_true", help="Retry yt-dlp transcript extraction for videos without cached transcript segments.")
     parser.add_argument("--retry-recent-count", type=int, default=DEFAULT_RETRY_RECENT_COUNT, help="Retry transcript extraction for this many recent videos when transcripts are missing.")
     parser.add_argument("--retry-recent-days", type=int, default=DEFAULT_RETRY_RECENT_DAYS, help="Retry transcript extraction for missing videos published within this many days.")
+    parser.add_argument("--manual-transcripts-dir", type=Path, default=DEFAULT_MANUAL_TRANSCRIPTS_DIR, help="Directory containing manual transcript JSON files named <videoId>.json.")
     parser.add_argument("--extra-search-json", type=Path, help="Optional JSON file with additional search fields keyed by video id.")
     parser.add_argument("--site-url", default=os.environ.get("SITE_URL", DEFAULT_SITE_URL), help="Public site URL used in sitemap and structured data.")
     args = parser.parse_args()
@@ -1482,6 +1559,7 @@ def main() -> int:
         retry_recent_count=max(0, args.retry_recent_count),
         retry_recent_days=max(0, args.retry_recent_days),
         update_mode=args.update_mode,
+        manual_transcripts_dir=args.manual_transcripts_dir,
     )
     print(f"Wrote {len(payload['videos'])} videos to {args.output}")
     return 0
