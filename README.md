@@ -15,17 +15,44 @@
 - 動画情報とコメントは YouTube Data API から取得
 - 字幕本文のみ yt-dlp で取得
 - 取得済み字幕は既存の検索インデックスから保持
-- 最新動画の字幕は一時的に未取得になる場合があります
+- `Update search index` が検索データを生成し、差分があれば commit/push して GitHub Pages にデプロイ
+- `build_index.py` が `index.html` の最新反映回を更新し、`search-index.json` の最新動画と不一致なら失敗
 
-## 手動字幕バックフィル
+### 手動実行モード
 
-GitHub Actions で bot 判定された動画だけ、ローカルで字幕を取得します。
+- `fresh`: 最新動画・直近動画の更新、手動字幕反映後の再生成に使う
+- `recent`: 通常の軽量補完に使う
+- `full`: 全体再検証が必要なときだけ使う
 
-```bash
-python work/scripts/export_transcript.py --video-id ayJ4SzJV0lc --output manual_transcripts/ayJ4SzJV0lc.json
+通常の `outputs/omocoro-watch-search/**` への push は、`Deploy search site` でもデプロイできます。
+
+## 手動字幕補完
+
+GitHub Actions runner で YouTube の bot 判定により字幕取得が失敗する場合だけ、ローカルで字幕を取得して `manual_transcripts/<videoId>.json` として反映します。
+
+```bat
+cd /d C:\omocoro-watch-search
+git pull
+python -m pip install -U yt-dlp
+python work\scripts\export_transcript.py --video-id VIDEO_ID --output manual_transcripts\VIDEO_ID.json
+git add manual_transcripts\VIDEO_ID.json
+git commit -m "Add manual transcript for VIDEO_ID"
+git push
 ```
 
-生成した `manual_transcripts/<videoId>.json` を commit/push し、`Update search index` を `fresh` で手動実行します。
+- `VIDEO_ID` に `<>` は付けない
+- YouTube URL の `v=` の後ろが videoId
+- `nothing to commit` が出た場合は反映済み
+- push 後、`Update search index` を `fresh` で手動実行
+- Actions ログで `transcript manual fallback: VIDEO_ID` と `manualTranscriptUsedVideos=1` を確認
+
+## データの扱い
+
+- `manual_transcripts/*.json`: 入力データ
+- `outputs/omocoro-watch-search/data/search-index.json`: 生成物
+- `outputs/omocoro-watch-search/data/search-index.js`: 生成物
+- `outputs/omocoro-watch-search/index.html` の最新反映回: 生成処理で更新
+- 生成物は手動編集しない
 
 ## 注意
 

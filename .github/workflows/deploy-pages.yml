@@ -40,3 +40,9 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
+
+      - name: Deploy summary
+        run: |
+          echo "deployTriggered=true"
+          echo "deployCompleted=true"
+          echo "deployUrl=${{ steps.deployment.outputs.page_url }}"

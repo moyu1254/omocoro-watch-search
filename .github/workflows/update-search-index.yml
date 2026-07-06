@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       update_mode:
-        description: "Update mode"
+        description: "fresh: latest/manual transcripts, recent: lightweight catch-up, full: full verification"
         type: choice
         required: true
         default: fresh
@@ -26,9 +26,18 @@ on:
 
 permissions:
   contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
 
 jobs:
   update:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -56,13 +65,33 @@ jobs:
             UPDATE_MODE="fresh"
           fi
           echo "updateMode=${UPDATE_MODE}"
-          python work/scripts/build_index.py --all --update-mode "${UPDATE_MODE}" --comments-per-video 20 --retry-missing-transcripts --retry-recent-count 5
+          python work/scripts/build_index.py --all --update-mode "${UPDATE_MODE}" --comments-per-video 20 --retry-missing-transcripts --retry-recent-count 5 --manual-transcripts-dir manual_transcripts
 
       - name: Validate index
         run: |
           python - <<'PY'
+          import html
           import json
+          import re
           from pathlib import Path
+          from urllib.parse import parse_qs, urlparse
+
+          def youtube_video_id(value):
+              parsed = urlparse(value or "")
+              host = parsed.netloc.lower()
+              if host.endswith("youtu.be"):
+                  return parsed.path.strip("/").split("/", 1)[0]
+              if "youtube.com" in host:
+                  query_ids = parse_qs(parsed.query).get("v") or []
+                  if query_ids:
+                      return query_ids[0]
+                  parts = [part for part in parsed.path.split("/") if part]
+                  for marker in ("embed", "live", "shorts"):
+                      if marker in parts:
+                          index = parts.index(marker)
+                          if index + 1 < len(parts):
+                              return parts[index + 1]
+              return ""
 
           path = Path("outputs/omocoro-watch-search/data/search-index.json")
           data = json.loads(path.read_text(encoding="utf-8"))
@@ -89,12 +118,87 @@ jobs:
               raise SystemExit(f"Missing required fields: {missing[:5]}")
           if not data.get("videos"):
               raise SystemExit("No videos found")
+          js_path = Path("outputs/omocoro-watch-search/data/search-index.js")
+          js_text = js_path.read_text(encoding="utf-8").strip()
+          prefix = "window.SEARCH_INDEX = "
+          if not js_text.startswith(prefix) or not js_text.endswith(";"):
+              raise SystemExit("search-index.js does not use the expected wrapper")
+          js_data = json.loads(js_text[len(prefix):-1])
+          if js_data != data:
+              raise SystemExit("search-index.js does not match search-index.json")
+          latest = data["videos"][0]
+          index_html = Path("outputs/omocoro-watch-search/index.html").read_text(encoding="utf-8")
+          latest_link = re.search(
+              r'<a id="latest-link" href="([^"]+)" target="_blank" rel="noopener noreferrer">(.*?)</a>',
+              index_html,
+              flags=re.S,
+          )
+          if not latest_link:
+              raise SystemExit("latest-link not found in index.html")
+          latest_link_id = youtube_video_id(html.unescape(latest_link.group(1)))
+          latest_link_title = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", "", latest_link.group(2)))).strip()
+          latest_title = re.sub(r"\s+", " ", latest.get("title") or "").strip()
+          if latest_link_id != latest.get("videoId") or latest_link_title != latest_title:
+              raise SystemExit(
+                  "latest-link mismatch: "
+                  f"search-index={latest.get('videoId')} {latest_title!r}, "
+                  f"index.html={latest_link_id} {latest_link_title!r}"
+              )
           print(f"videos={len(data['videos'])}")
           print(f"segments={sum(len(video['transcriptSegments']) for video in data['videos'])}")
+          print(f"latestVideoId={latest.get('videoId')}")
+          print(f"latestVideoTitle={latest_title}")
+          print(f"latestLinkVideoId={latest_link_id}")
           PY
 
-      - name: Commit updated index
-        uses: stefanzweifel/git-auto-commit-action@v5
+      - name: Commit updated site
+        id: commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add -- \
+            outputs/omocoro-watch-search/data/search-index.json \
+            outputs/omocoro-watch-search/data/search-index.js \
+            outputs/omocoro-watch-search/index.html \
+            outputs/omocoro-watch-search/videos.html \
+            outputs/omocoro-watch-search/sitemap.xml \
+            outputs/omocoro-watch-search/robots.txt
+          if git diff --cached --quiet; then
+            echo "No generated changes to commit."
+            echo "changes_detected=false" >> "$GITHUB_OUTPUT"
+            echo "deployTriggered=false"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -m "Update Omocoro Watch search index"
+            git push
+            echo "changes_detected=true" >> "$GITHUB_OUTPUT"
+            echo "deployTriggered=true"
+          fi
+
+      - name: Setup Pages
+        if: steps.commit.outputs.changes_detected == 'true'
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        if: steps.commit.outputs.changes_detected == 'true'
+        uses: actions/upload-pages-artifact@v3
         with:
-          commit_message: "Update Omocoro Watch search index"
-          file_pattern: outputs/omocoro-watch-search/data/search-index.json outputs/omocoro-watch-search/data/search-index.js outputs/omocoro-watch-search/index.html outputs/omocoro-watch-search/about.html outputs/omocoro-watch-search/styles.css outputs/omocoro-watch-search/videos.html outputs/omocoro-watch-search/sitemap.xml outputs/omocoro-watch-search/robots.txt
+          path: outputs/omocoro-watch-search
+
+      - name: Deploy to GitHub Pages
+        if: steps.commit.outputs.changes_detected == 'true'
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Deploy summary
+        if: steps.commit.outputs.changes_detected == 'true'
+        run: |
+          echo "deployCompleted=true"
+          echo "deployUrl=${{ steps.deployment.outputs.page_url }}"
+
+      - name: Deploy skipped
+        if: steps.commit.outputs.changes_detected != 'true'
+        run: |
+          echo "deployTriggered=false"
+          echo "deployCompleted=false"

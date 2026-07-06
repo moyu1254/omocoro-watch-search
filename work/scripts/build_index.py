@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
-from urllib.parse import urlencode, unquote, urlparse
+from urllib.parse import parse_qs, urlencode, unquote, urlparse
 from urllib.request import urlopen
 from xml.etree import ElementTree
 
@@ -532,6 +532,24 @@ def safe_href(value: str, fallback: str = "#") -> str:
     return fallback
 
 
+def extract_youtube_video_id(value: str) -> str:
+    parsed = urlparse(str(value or ""))
+    host = parsed.netloc.lower()
+    if host.endswith("youtu.be"):
+        return parsed.path.strip("/").split("/", 1)[0]
+    if "youtube.com" in host:
+        query_video_ids = parse_qs(parsed.query).get("v") or []
+        if query_video_ids:
+            return query_video_ids[0]
+        parts = [part for part in parsed.path.split("/") if part]
+        for marker in ("embed", "live", "shorts"):
+            if marker in parts:
+                index = parts.index(marker)
+                if index + 1 < len(parts):
+                    return parts[index + 1]
+    return ""
+
+
 def script_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2).replace("</", "<\\/")
 
@@ -1037,27 +1055,80 @@ def fetch_transcript(ydl: Any, video_id: str, lang_order: list[str]) -> list[dic
     return segments
 
 
-def update_homepage_latest_link(payload: dict[str, Any], output: Path) -> None:
+LATEST_LINK_PATTERN = re.compile(
+    r'(<a id="latest-link" href=")(?P<href>[^"]+)(" target="_blank" rel="noopener noreferrer">)'
+    r"(?P<title>.*?)(</a>)",
+    re.DOTALL,
+)
+
+
+def update_homepage_latest_link(payload: dict[str, Any], output: Path) -> bool:
     index_path = output.parent.parent / "index.html"
     if not index_path.exists():
-        return
+        raise SystemExit(f"Homepage not found: {index_path}")
 
     videos = payload.get("videos") or []
     if not videos:
-        return
+        raise SystemExit("Cannot update latest-link because generated videos are empty.")
 
     latest = videos[0]
     latest_url = safe_href(latest.get("url") or "")
     latest_title = escape_html(latest.get("title") or "")
     html = index_path.read_text(encoding="utf-8")
-    html = re.sub(
-        r'(<a id="latest-link" href=")[^"]+(" target="_blank" rel="noopener noreferrer">)(.*?)(</a>)',
-        lambda match: f'{match.group(1)}{escape_html(latest_url)}{match.group(2)}{latest_title}{match.group(4)}',
+    match = LATEST_LINK_PATTERN.search(html)
+    if not match:
+        raise SystemExit("Homepage latest-link was not found. Aborting to avoid a stale latest reflected video.")
+
+    previous_url = html_lib.unescape(match.group("href"))
+    previous_title = normalize_text(html_lib.unescape(re.sub(r"<[^>]+>", "", match.group("title"))))
+    next_title = normalize_text(latest.get("title") or "")
+    html, count = LATEST_LINK_PATTERN.subn(
+        lambda found: (
+            f'{found.group(1)}{escape_html(latest_url)}{found.group(3)}'
+            f"{latest_title}{found.group(5)}"
+        ),
         html,
         count=1,
-        flags=re.DOTALL,
     )
+    if count != 1:
+        raise SystemExit("Homepage latest-link update did not affect exactly one link.")
     index_path.write_text(html, encoding="utf-8")
+    return previous_url != latest_url or previous_title != next_title
+
+
+def validate_homepage_latest_link(payload: dict[str, Any], output: Path) -> dict[str, str]:
+    index_path = output.parent.parent / "index.html"
+    if not index_path.exists():
+        raise SystemExit(f"Homepage not found: {index_path}")
+
+    videos = payload.get("videos") or []
+    if not videos:
+        raise SystemExit("Cannot validate latest-link because generated videos are empty.")
+
+    latest = videos[0]
+    expected_video_id = normalize_text(latest.get("videoId") or "")
+    expected_title = normalize_text(latest.get("title") or "")
+    html = index_path.read_text(encoding="utf-8")
+    match = LATEST_LINK_PATTERN.search(html)
+    if not match:
+        raise SystemExit("Homepage latest-link was not found.")
+
+    latest_link_url = html_lib.unescape(match.group("href"))
+    latest_link_video_id = extract_youtube_video_id(latest_link_url)
+    latest_link_title = normalize_text(html_lib.unescape(re.sub(r"<[^>]+>", "", match.group("title"))))
+    if latest_link_video_id != expected_video_id or latest_link_title != expected_title:
+        raise SystemExit(
+            "Homepage latest-link does not match search-index.json latest video: "
+            f"index={expected_video_id} {expected_title!r}, "
+            f"homepage={latest_link_video_id} {latest_link_title!r}."
+        )
+
+    return {
+        "latestVideoId": expected_video_id,
+        "latestVideoTitle": expected_title,
+        "latestLinkVideoId": latest_link_video_id,
+        "latestLinkTitle": latest_link_title,
+    }
 
 
 def update_homepage_site_url(output: Path, site_url: str) -> None:
@@ -1518,7 +1589,12 @@ def build_index(
     print_payload_statistics(payload, output)
     write_static_seo_files(payload, output, site_url)
     update_homepage_site_url(output, site_url)
-    update_homepage_latest_link(payload, output)
+    latest_link_updated = update_homepage_latest_link(payload, output)
+    latest_link_info = validate_homepage_latest_link(payload, output)
+    print(f"latestVideoId={latest_link_info['latestVideoId']}", file=sys.stderr)
+    print(f"latestVideoTitle={latest_link_info['latestVideoTitle']}", file=sys.stderr)
+    print(f"latestLinkVideoId={latest_link_info['latestLinkVideoId']}", file=sys.stderr)
+    print(f"latestLinkUpdated={str(latest_link_updated).lower()}", file=sys.stderr)
     return payload
 
 
