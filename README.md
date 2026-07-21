@@ -31,7 +31,6 @@
 GitHub Actions runner で YouTube の bot 判定により字幕取得が失敗する場合だけ、ローカルで字幕を取得して `manual_transcripts/<videoId>.json` として反映します。
 
 ```bat
-cd /d C:\omocoro-watch-search
 git pull
 python -m pip install -U yt-dlp
 python work\scripts\export_transcript.py --video-id VIDEO_ID --output manual_transcripts\VIDEO_ID.json
