@@ -30,14 +30,13 @@ permissions:
   id-token: write
 
 concurrency:
-  group: pages
-  cancel-in-progress: false
+  group: update-search-index
+  cancel-in-progress: true
 
 jobs:
   update:
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+    outputs:
+      changes_detected: ${{ steps.commit.outputs.changes_detected }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -186,19 +185,28 @@ jobs:
         with:
           path: outputs/omocoro-watch-search
 
-      - name: Deploy to GitHub Pages
-        if: steps.commit.outputs.changes_detected == 'true'
-        id: deployment
-        uses: actions/deploy-pages@v4
-
-      - name: Deploy summary
-        if: steps.commit.outputs.changes_detected == 'true'
-        run: |
-          echo "deployCompleted=true"
-          echo "deployUrl=${{ steps.deployment.outputs.page_url }}"
-
       - name: Deploy skipped
         if: steps.commit.outputs.changes_detected != 'true'
         run: |
           echo "deployTriggered=false"
           echo "deployCompleted=false"
+
+  deploy:
+    needs: update
+    if: needs.update.outputs.changes_detected == 'true'
+    concurrency:
+      group: pages
+      cancel-in-progress: true
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Deploy summary
+        run: |
+          echo "deployCompleted=true"
+          echo "deployUrl=${{ steps.deployment.outputs.page_url }}"
