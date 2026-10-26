@@ -898,11 +898,11 @@ def write_static_seo_files(payload: dict[str, Any], output: Path, site_url: str)
   </head>
   <body>
     <header class="site-header">
-      <a class="brand" href="./index.html">オモウォのあの回</a>
+      <a class="brand" href="/">オモウォのあの回</a>
     </header>
     <main class="video-list-page">
       <h1>回一覧</h1>
-      <p class="source-links"><a href="./index.html">検索</a></p>
+      <p class="source-links"><a href="/">検索</a></p>
       <div class="video-list">
         {''.join(rows)}
       </div>
